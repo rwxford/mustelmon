@@ -64,6 +64,10 @@ kubectl port-forward svc/mustelmon 3000:3000
 
 The manifest runs mustelmon as a pod with `hostNetwork: true` so it can scan the node's network.
 
+### Option 5 — TrueNAS SCALE
+
+See the [TrueNAS deployment section](#truenas-scale) below for full instructions covering Electric Eel (24.10+) and Dragonfish (24.04).
+
 ---
 
 ## Tailscale integration
@@ -148,6 +152,214 @@ mustelmon/
 ├── k8s.yaml
 └── package.json
 ```
+
+---
+
+---
+
+## TrueNAS SCALE
+
+mustelmon runs on TrueNAS SCALE via its built-in Apps system. The key requirement for network scanning to work is **host networking** — the container must share the TrueNAS host's network namespace so it can read the ARP table and reach devices on the LAN.
+
+> **TrueNAS CORE** is FreeBSD and cannot run Linux containers natively. Use the [Linux VM method](#truenas-core--linux-vm) at the bottom of this section instead.
+
+---
+
+### Electric Eel (24.10 and later) — Custom App
+
+Electric Eel replaced the K3s app engine with Docker. The easiest deployment is via the **Custom App** wizard, which accepts a Docker Compose file directly.
+
+**Step 1 — Open Custom App**
+
+`Apps` → `Discover Apps` → `Custom App`
+
+**Step 2 — Paste the Compose config**
+
+In the **Docker Compose** field paste the following. It is identical to the repo's `docker-compose.yml` with the volume mounts removed (TrueNAS SCALE already exposes `/proc` to containers running in host network mode).
+
+```yaml
+services:
+  mustelmon:
+    image: ghcr.io/rwxford/mustelmon:latest
+    network_mode: host
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      - PORT=3000
+```
+
+**Step 3 — Save and deploy**
+
+Click **Save** then **Deploy**. TrueNAS will pull the image and start the container.
+
+**Step 4 — Open the dashboard**
+
+`http://<your-truenas-ip>:3000`
+
+---
+
+### Electric Eel — Shell method
+
+If you prefer the shell (via SSH or `System` → `Shell`):
+
+```bash
+docker run -d \
+  --name mustelmon \
+  --network host \
+  --restart unless-stopped \
+  --cap-add NET_RAW \
+  --cap-add NET_ADMIN \
+  ghcr.io/rwxford/mustelmon:latest
+```
+
+Check logs:
+
+```bash
+docker logs -f mustelmon
+```
+
+Stop and remove:
+
+```bash
+docker stop mustelmon && docker rm mustelmon
+```
+
+---
+
+### Dragonfish (24.04) — Custom App
+
+Dragonfish uses a K3s-based app engine. The **Custom App** wizard presents a form rather than a Compose file.
+
+**Step 1 — Open Custom App**
+
+`Apps` → `Available Applications` → `Custom App`
+
+**Step 2 — Fill in the form**
+
+| Field | Value |
+|---|---|
+| Application Name | `mustelmon` |
+| Image Repository | `ghcr.io/rwxford/mustelmon` |
+| Image Tag | `latest` |
+| Image Pull Policy | `Always` |
+
+Scroll to **Networking**:
+
+| Field | Value |
+|---|---|
+| Host Network | ✅ Enabled |
+
+Scroll to **Port Forwarding** — leave empty (host network mode handles this directly).
+
+Scroll to **Environment Variables** → Add:
+
+| Name | Value |
+|---|---|
+| `PORT` | `3000` |
+
+Scroll to **Security Context** → Add capabilities:
+- `NET_RAW`
+- `NET_ADMIN`
+
+**Step 3 — Install**
+
+Click **Install**. Wait for the workload to show `Running`.
+
+**Step 4 — Open the dashboard**
+
+`http://<your-truenas-ip>:3000`
+
+---
+
+### Updating
+
+**Electric Eel (Custom App UI):** `Apps` → find mustelmon → `Update` (if a new image digest is available) or click `Pull latest image` then recreate.
+
+**Electric Eel (shell):**
+
+```bash
+docker pull ghcr.io/rwxford/mustelmon:latest
+docker stop mustelmon && docker rm mustelmon
+docker run -d --name mustelmon --network host --restart unless-stopped \
+  --cap-add NET_RAW --cap-add NET_ADMIN \
+  ghcr.io/rwxford/mustelmon:latest
+```
+
+**Dragonfish:** `Apps` → mustelmon → `Edit` → change tag or bump the image, then save.
+
+---
+
+### Networking note
+
+mustelmon discovers devices by sending TCP probes to every address in the local `/24` subnet and reading `/proc/net/arp`. With `host` networking the container sees the same ARP table and routing table as TrueNAS itself, so it discovers whatever is visible on the NAS's primary interface (typically `igb0`, `em0`, `eno1`, or similar).
+
+If your TrueNAS has multiple interfaces (separate LAN, IoT VLAN, etc.) mustelmon will scan the subnet of whichever interface holds the default route. To monitor a different subnet, route traffic through that interface or run a second instance with an adjusted `PORT`.
+
+---
+
+### TrueNAS CORE — Linux VM
+
+TrueNAS CORE (FreeBSD) does not run Linux containers. The cleanest path is a lightweight Linux VM using the built-in bhyve hypervisor.
+
+**Step 1 — Create a VM**
+
+`Virtual Machines` → `Add`
+
+| Setting | Recommended value |
+|---|---|
+| Guest OS | Linux |
+| Name | `mustelmon` |
+| CPU / Memory | 1 vCPU, 512 MB RAM |
+| Disk | 8 GB (min) |
+| ISO | Ubuntu Server 24.04 LTS or Debian 12 |
+| NIC | `virtio` attached to your LAN bridge |
+
+**Step 2 — Install the OS**
+
+Boot the VM and complete the standard Linux installer. Enable SSH for easier management.
+
+**Step 3 — Install Node.js and clone mustelmon**
+
+```bash
+# On the VM
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs git
+
+git clone https://github.com/rwxford/mustelmon.git
+cd mustelmon
+node server.js
+```
+
+To run it persistently with systemd:
+
+```bash
+sudo tee /etc/systemd/system/mustelmon.service > /dev/null <<'EOF'
+[Unit]
+Description=mustelmon network monitor
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /home/<user>/mustelmon/server.js
+WorkingDirectory=/home/<user>/mustelmon
+Restart=always
+User=<user>
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mustelmon
+```
+
+**Step 4 — Access the dashboard**
+
+`http://<vm-ip>:3000`
+
+The VM is on the same LAN as TrueNAS, so mustelmon will scan and discover NAS shares, other VMs, and every other device on the network.
 
 ---
 
