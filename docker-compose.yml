@@ -1,0 +1,17 @@
+services:
+  mustelmon:
+    build: .
+    # host networking is required to read the host ARP table and scan the local subnet
+    network_mode: host
+    # /proc/net/arp and /proc/net/dev are read-only from the host
+    volumes:
+      - /proc/net/arp:/proc/net/arp:ro
+      - /proc/net/dev:/proc/net/dev:ro
+    # allow raw socket access for ARP/ICMP (not strictly required but improves discovery)
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    restart: unless-stopped
+    # PORT is the only supported env var
+    environment:
+      - PORT=3000

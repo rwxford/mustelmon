@@ -1,0 +1,72 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mustelmon
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mustelmon
+  namespace: mustelmon
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mustelmon
+  namespace: mustelmon
+  labels:
+    app: mustelmon
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mustelmon
+  template:
+    metadata:
+      labels:
+        app: mustelmon
+    spec:
+      serviceAccountName: mustelmon
+      # hostNetwork gives the pod visibility of the node's ARP table and local subnet
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: mustelmon
+          image: ghcr.io/rwxford/mustelmon:latest
+          # Or build locally and use: image: mustelmon:latest
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: PORT
+              value: "3000"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            capabilities:
+              add:
+                - NET_RAW
+                - NET_ADMIN
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mustelmon
+  namespace: mustelmon
+spec:
+  selector:
+    app: mustelmon
+  ports:
+    - port: 3000
+      targetPort: 3000
+      name: http
+  type: ClusterIP
