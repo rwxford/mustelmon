@@ -43,6 +43,12 @@ spec:
           env:
             - name: PORT
               value: "3000"
+            # Require a login (recommended). Prefer a Secret over a literal:
+            # - name: MUSTELMON_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: mustelmon
+            #       key: password
           resources:
             requests:
               cpu: 50m

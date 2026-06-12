@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const os = require('os');
+const crypto = require('crypto');
 const dns = require('dns').promises;
 const { execFile, exec } = require('child_process');
 const { promisify } = require('util');
@@ -79,6 +80,82 @@ function parseNetstatIb(stdout) {
     counters[name] = { rx, tx, mac };
   }
   return counters;
+}
+
+// ── AUTHENTICATION ─────────────────────────────────────────────────────────────
+// Single shared password via MUSTELMON_PASSWORD. When unset, auth is
+// disabled and the dashboard is open (the pre-auth behaviour). Sessions are
+// HMAC-signed cookies; the secret is generated at boot, so restarting the
+// server invalidates all sessions. Cookies (not bearer tokens) are used
+// because EventSource cannot send custom headers to the /events stream.
+const AUTH_PASSWORD = process.env.MUSTELMON_PASSWORD || '';
+const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
+const SESSION_SECRET = crypto.randomBytes(32);
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const COOKIE_NAME = 'mustelmon_session';
+
+// Per-IP throttling: 5 consecutive failures lock the IP out for 60 seconds.
+const loginFailures = new Map();
+
+function sha256(s) {
+  return crypto.createHash('sha256').update(s).digest();
+}
+
+// Hashing both sides first makes timingSafeEqual usable with inputs of
+// different lengths without leaking the password length.
+function passwordMatches(candidate) {
+  return crypto.timingSafeEqual(sha256(candidate), sha256(AUTH_PASSWORD));
+}
+
+function makeSessionToken() {
+  const exp = Date.now() + SESSION_TTL_MS;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(String(exp)).digest('hex');
+  return `${exp}.${sig}`;
+}
+
+function verifySessionToken(token) {
+  if (!token) return false;
+  const [expStr, sig] = token.split('.');
+  const exp = parseInt(expStr, 10);
+  if (!exp || !sig || Date.now() > exp) return false;
+  const expect = crypto.createHmac('sha256', SESSION_SECRET).update(String(exp)).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expect, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+function isAuthenticated(req) {
+  if (!AUTH_ENABLED) return true;
+  return verifySessionToken(parseCookies(req)[COOKIE_NAME]);
+}
+
+function loginLocked(ip) {
+  const f = loginFailures.get(ip);
+  return !!(f && f.lockedUntil && Date.now() < f.lockedUntil);
+}
+
+function recordLoginFailure(ip) {
+  const f = loginFailures.get(ip) || { count: 0, lockedUntil: 0 };
+  f.count++;
+  if (f.count >= 5) {
+    f.lockedUntil = Date.now() + 60000;
+    f.count = 0;
+  }
+  loginFailures.set(ip, f);
 }
 
 // ── MAC OUI VENDOR MAP (common prefixes) ─────────────────────────────────────
@@ -1284,6 +1361,84 @@ const server = http.createServer(async (req, res) => {
   // CORS for dev
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  // ── Auth routes (public) ──
+  if (url.pathname === '/api/auth') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ enabled: AUTH_ENABLED, authenticated: isAuthenticated(req) }));
+    return;
+  }
+
+  if (url.pathname === '/api/login' && req.method === 'POST') {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', () => {
+      if (!AUTH_ENABLED) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Authentication is disabled' }));
+        return;
+      }
+      const ip = req.socket.remoteAddress || 'unknown';
+      if (loginLocked(ip)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Too many attempts. Try again in a minute.' }));
+        return;
+      }
+      let password = '';
+      try { password = String(JSON.parse(body).password || ''); } catch {}
+      if (password && passwordMatches(password)) {
+        loginFailures.delete(ip);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Set-Cookie': `${COOKIE_NAME}=${makeSessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+        });
+        res.end(JSON.stringify({ ok: true }));
+      } else {
+        recordLoginFailure(ip);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Incorrect password' }));
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/logout' && req.method === 'POST') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Set-Cookie': `${COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+    });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (url.pathname === '/login') {
+    if (!AUTH_ENABLED || isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+    try {
+      const data = fs.readFileSync(path.join(__dirname, 'public', 'login.html'));
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(data);
+    } catch {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
+  // ── Auth gate: everything below requires a session when auth is enabled ──
+  if (!isAuthenticated(req)) {
+    if (url.pathname.startsWith('/api/') || url.pathname === '/events') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Authentication required' }));
+    } else {
+      res.writeHead(302, { Location: '/login' });
+      res.end();
+    }
+    return;
+  }
+
   // SSE stream
   if (url.pathname === '/events') {
     res.writeHead(200, {
@@ -1402,6 +1557,11 @@ module.exports = {
 if (require.main === module) {
 server.listen(PORT, () => {
   console.log(`Network Monitor running at http://localhost:${PORT}`);
+  if (AUTH_ENABLED) {
+    console.log('Authentication enabled (MUSTELMON_PASSWORD is set)');
+  } else {
+    console.warn('WARNING: authentication is disabled; anyone who can reach this port can view the dashboard. Set MUSTELMON_PASSWORD to require a login.');
+  }
 
   // Initial data gather
   getEnvironment().catch(console.error); // warm cache early

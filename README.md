@@ -20,6 +20,7 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
 - **Environment detection** — automatically identifies whether it is running inside Kubernetes (and which distribution: K3s, EKS, GKE, AKS…), Docker, a VM, WSL, or bare metal. Decodes the Kubernetes service account JWT, reads cluster CIDR ranges, fingerprints the overlay MTU (VXLAN/Flannel = 1450, WireGuard = 1410, IPIP = 1480), and detects workload platforms (Coder, Gitpod, Codespaces)
 - **Tailscale network panel** — enter a Tailscale API key to fetch all devices on the tailnet: IPs, OS, online status, tags, advertised routes, client version, last-seen
 - **SSE-based live updates** — no polling from the browser; the server pushes bandwidth, scan, and Tailscale events over a persistent connection
+- **Optional authentication** — set `MUSTELMON_PASSWORD` to require a login; sessions are signed HttpOnly cookies
 - **No build step** — single `server.js` + one HTML file, no npm packages required
 
 ---
@@ -141,6 +142,32 @@ PORT=8080 node server.js
 
 It defaults to 3000.
 
+### Authentication
+
+By default the dashboard is open to anyone who can reach the port. Set
+`MUSTELMON_PASSWORD` to require a login:
+
+```bash
+MUSTELMON_PASSWORD=change-me node server.js
+```
+
+Notes:
+
+- A single shared password protects the dashboard, all API routes, and the
+  live event stream.
+- Sessions are HMAC-signed, HttpOnly cookies valid for 7 days. The signing
+  secret is generated at startup, so restarting the server signs everyone
+  out.
+- Five consecutive failed attempts lock the source IP out for 60 seconds.
+- mustelmon serves plain HTTP. On an untrusted network (hotel or cafe
+  Wi-Fi), keep it bound to localhost, or reach a remote instance over
+  Tailscale rather than exposing the port. Enabling the password is
+  strongly recommended when running on a laptop, where any device on the
+  same public network could otherwise open the dashboard.
+- For Docker/Compose/Kubernetes/TrueNAS, set `MUSTELMON_PASSWORD` as an
+  environment variable (see the commented examples in `docker-compose.yml`
+  and `k8s.yaml`).
+
 ---
 
 ## Project structure
@@ -149,7 +176,8 @@ It defaults to 3000.
 mustelmon/
 ├── server.js          # HTTP server, scanner, fingerprinter, Tailscale proxy
 ├── public/
-│   └── index.html     # Single-page dashboard (no framework, no build step)
+│   ├── index.html     # Single-page dashboard (no framework, no build step)
+│   └── login.html     # Login page (used when MUSTELMON_PASSWORD is set)
 ├── test.js            # Zero-dependency tests for the platform parsers
 ├── Dockerfile
 ├── docker-compose.yml

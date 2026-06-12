@@ -759,6 +759,7 @@ td {
     </div>
   </div>
   <button id="scan-btn" onclick="triggerScan()">&#128269; Scan Network</button>
+  <button id="logout-btn" onclick="logout()" style="display:none;background:var(--bg3);color:var(--text-dim);border:1px solid var(--border2);border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;margin-left:8px" title="Sign out">Sign out</button>
 </header>
 
 <div class="container">
@@ -1536,6 +1537,11 @@ async function fetchAll() {
       fetch('/api/environment'),
       fetch('/api/tailscale'),
     ]);
+    // Session expired or not signed in; the server gates all API routes.
+    if (netRes.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
     networkInfo = await netRes.json();
     devices = await devRes.json();
     connectivity = await connRes.json();
@@ -1613,8 +1619,23 @@ setInterval(() => {
 }, 15000);
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
+initAuth();
 fetchAll();
 connectSSE();
+
+// ── AUTH ─────────────────────────────────────────────────────────────────────
+async function initAuth() {
+  try {
+    const res = await fetch('/api/auth');
+    const auth = await res.json();
+    if (auth.enabled) document.getElementById('logout-btn').style.display = 'inline-block';
+  } catch {}
+}
+
+async function logout() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch {}
+  window.location.href = '/login';
+}
 </script>
 </body>
 </html>
