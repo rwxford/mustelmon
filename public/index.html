@@ -379,6 +379,39 @@ td {
 .ts-btn-connect:hover { background: var(--blue); }
 .ts-btn-disconnect { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
 .ts-btn-disconnect:hover { background: rgba(248,81,73,0.25); }
+.ts-btn:disabled { background: var(--bg3); color: var(--text-dim); cursor: default; }
+
+/* travel connectivity panel */
+#travel-panel { margin-top: 16px; }
+.travel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  padding: 4px 0;
+}
+.travel-box {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.travel-box h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+.travel-verdict { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; margin-bottom: 6px; }
+.travel-verdict .dot { width: 7px; height: 7px; border-radius: 50%; }
+.travel-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 2px 0; }
+.travel-row .k { color: var(--text-dim); }
+.travel-row .v { font-family: var(--mono); color: var(--text-bright); text-align: right; word-break: break-all; }
+.travel-ports { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 4px; }
+.travel-port { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+.travel-port.open { background: rgba(63,185,80,0.12); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.travel-port.closed { background: rgba(248,81,73,0.12); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
 
 .ts-status {
   display: flex;
@@ -933,6 +966,28 @@ td {
           <div class="ts-empty">Loading devices...</div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- TRAVEL PANEL -->
+  <div id="travel-panel" class="card">
+    <div class="card-header">
+      <span style="font-size:15px">&#9992;&#65039;</span>
+      <span class="card-title">Travel Connectivity</span>
+      <span id="travel-checked-at" style="margin-left:auto;font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0 10px">
+        <button id="travel-check-btn" class="ts-btn ts-btn-connect" onclick="runTravelCheck()">Run Checks</button>
+        <button id="travel-speed-btn" class="ts-btn ts-btn-connect" onclick="runSpeedtest()">Speed Test</button>
+        <span style="font-size:11px;color:var(--text-dim)">
+          Captive portal, DNS tampering, latency, and blocked-port checks for untrusted Wi-Fi.
+          The speed test transfers ~20&nbsp;MB down / ~5&nbsp;MB up &mdash; avoid it on metered connections.
+        </span>
+      </div>
+      <div id="travel-error" style="display:none;color:var(--red);font-size:12px;padding:4px 0"></div>
+      <div id="travel-results" class="travel-grid" style="display:none"></div>
+      <div id="travel-speed" class="travel-grid" style="display:none"></div>
     </div>
   </div>
 
@@ -1635,6 +1690,95 @@ async function initAuth() {
 async function logout() {
   try { await fetch('/api/logout', { method: 'POST' }); } catch {}
   window.location.href = '/login';
+}
+
+// travel connectivity checks
+function travelVerdict(ok, okText, badText, warn) {
+  const cls = ok ? 'dot-green' : (warn ? 'dot-yellow' : 'dot-red');
+  const color = ok ? 'var(--green)' : (warn ? 'var(--yellow)' : 'var(--red)');
+  return `<div class="travel-verdict" style="color:${color}"><span class="dot ${cls}"></span>${ok ? okText : badText}</div>`;
+}
+
+function travelRow(k, v) {
+  return `<div class="travel-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+function renderTravelResults(r) {
+  const out = [];
+
+  let portal = `<div class="travel-box"><h4>Captive Portal</h4>`;
+  if (r.portal.verdict === 'online') portal += travelVerdict(true, 'Online &mdash; no portal');
+  else if (r.portal.verdict === 'portal') portal += travelVerdict(false, '', 'Captive portal detected', true);
+  else portal += travelVerdict(false, '', 'No internet access');
+  if (r.portal.portalUrl) portal += travelRow('Portal', `<a href="${r.portal.portalUrl}" target="_blank" rel="noopener">open page</a>`);
+  r.portal.probes.forEach(p => { portal += travelRow(p.name + ' probe', p.status); });
+  out.push(portal + '</div>');
+
+  const dnsOk = !r.dns.nxdomainHijack && r.dns.knownAnswer === 'ok';
+  let dnsBox = `<div class="travel-box"><h4>DNS Integrity</h4>`;
+  dnsBox += travelVerdict(dnsOk, 'No tampering detected', r.dns.nxdomainHijack ? 'Answers are rewritten' : 'Lookups unreliable', !r.dns.nxdomainHijack);
+  dnsBox += travelRow('NXDOMAIN test', r.dns.nxdomainHijack ? 'hijacked' : 'clean');
+  dnsBox += travelRow('Known answer', r.dns.knownAnswer);
+  dnsBox += travelRow('DoH 1.1.1.1', r.dns.dohReachable ? 'reachable' : 'blocked');
+  r.dns.issues.forEach(i => { dnsBox += `<div style="color:var(--yellow);font-size:11px;padding-top:4px">${i}</div>`; });
+  out.push(dnsBox + '</div>');
+
+  const lat = r.latency;
+  const latOk = lat.lossPct === 0 && lat.avgMs !== null && lat.avgMs < 150;
+  let latBox = `<div class="travel-box"><h4>Latency &mdash; ${lat.host}:${lat.port}</h4>`;
+  latBox += travelVerdict(latOk, 'Healthy', lat.lossPct === 100 ? 'Unreachable' : 'Degraded', lat.lossPct < 100);
+  latBox += travelRow('Loss', lat.lossPct + '%');
+  latBox += travelRow('Avg / jitter', lat.avgMs === null ? '&mdash;' : `${lat.avgMs} ms / ${lat.jitterMs} ms`);
+  latBox += travelRow('Min / max', lat.minMs === null ? '&mdash;' : `${lat.minMs} ms / ${lat.maxMs} ms`);
+  out.push(latBox + '</div>');
+
+  const blocked = r.egress.filter(p => !p.open).length;
+  let eg = `<div class="travel-box"><h4>Outbound Ports</h4>`;
+  eg += travelVerdict(blocked === 0, 'All test ports open', `${blocked} of ${r.egress.length} blocked`, blocked < r.egress.length);
+  eg += '<div class="travel-ports">' + r.egress.map(p =>
+    `<span class="travel-port ${p.open ? 'open' : 'closed'}" title="${p.label}: ${p.open ? 'open' : 'blocked'}">${p.port}</span>`).join('') + '</div>';
+  out.push(eg + '</div>');
+
+  const el = document.getElementById('travel-results');
+  el.innerHTML = out.join('');
+  el.style.display = 'grid';
+  document.getElementById('travel-checked-at').textContent = 'Checked ' + new Date(r.checkedAt).toLocaleTimeString();
+}
+
+async function travelPost(path, btn, busyLabel, idleLabel) {
+  const err = document.getElementById('travel-error');
+  btn.disabled = true; btn.textContent = busyLabel;
+  err.style.display = 'none';
+  try {
+    const res = await fetch(path, { method: 'POST' });
+    if (res.status === 401) { window.location.href = '/login'; return null; }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = 'block';
+    return null;
+  } finally {
+    btn.disabled = false; btn.textContent = idleLabel;
+  }
+}
+
+async function runTravelCheck() {
+  const data = await travelPost('/api/travel/check', document.getElementById('travel-check-btn'), 'Checking...', 'Run Checks');
+  if (data) renderTravelResults(data);
+}
+
+async function runSpeedtest() {
+  const data = await travelPost('/api/travel/speedtest', document.getElementById('travel-speed-btn'), 'Testing...', 'Speed Test');
+  if (!data) return;
+  const el = document.getElementById('travel-speed');
+  el.innerHTML = '<div class="travel-box"><h4>Speed &mdash; speed.cloudflare.com</h4>'
+    + travelRow('Download', data.download.mbps + ' Mbps')
+    + travelRow('Upload', data.upload.mbps + ' Mbps')
+    + travelRow('TTFB', data.download.ttfbMs + ' ms')
+    + '</div>';
+  el.style.display = 'grid';
 }
 </script>
 </body>

@@ -1339,6 +1339,197 @@ async function checkConnectivity() {
 }
 
 // ── SSE CLIENTS ───────────────────────────────────────────────────────────────
+// ── TRAVEL CHECKS ───────────────────────────────────────────────────────────
+// On-demand diagnostics for untrusted networks (hotel/cafe Wi-Fi):
+// captive portal detection, DNS tampering, latency/jitter/loss, and
+// outbound port blocking.
+
+// Both endpoints return fixed content on a clean network. A redirect or
+// altered body means something intercepts plain HTTP (a captive portal).
+async function checkCaptivePortal() {
+  const probes = [
+    {
+      name: 'Apple', host: 'captive.apple.com', path: '/hotspot-detect.html',
+      expect: r => r.statusCode === 200 && r.body.includes('Success'),
+    },
+    {
+      name: 'Google', host: 'www.gstatic.com', path: '/generate_204',
+      expect: r => r.statusCode === 204,
+    },
+  ];
+  const results = await Promise.all(probes.map(async p => {
+    const raw = await httpRequest(p.host, 80, p.path, 4000);
+    const parsed = parseHttpResponse(raw);
+    if (!parsed || !parsed.statusCode) return { name: p.name, status: 'offline' };
+    if (p.expect(parsed)) return { name: p.name, status: 'ok' };
+    return { name: p.name, status: 'portal', portalUrl: parsed.location || null, statusCode: parsed.statusCode };
+  }));
+  const portal = results.find(r => r.status === 'portal');
+  const okCount = results.filter(r => r.status === 'ok').length;
+  return {
+    verdict: portal ? 'portal' : okCount > 0 ? 'online' : 'offline',
+    portalUrl: portal?.portalUrl || null,
+    probes: results,
+  };
+}
+
+async function checkDnsIntegrity() {
+  const out = { nxdomainHijack: null, knownAnswer: null, dohReachable: null, issues: [] };
+
+  // A random subdomain must NXDOMAIN. Portals that rewrite DNS answer
+  // everything, which is the most common hijack signature.
+  const ghost = `mustelmon-${crypto.randomBytes(6).toString('hex')}.example.com`;
+  try {
+    await dns.resolve4(ghost);
+    out.nxdomainHijack = true;
+    out.issues.push('A nonexistent name resolved: this network rewrites DNS answers');
+  } catch {
+    out.nxdomainHijack = false;
+  }
+
+  // one.one.one.one has a stable, well-known answer set.
+  try {
+    const addrs = await dns.resolve4('one.one.one.one');
+    out.knownAnswer = addrs.some(a => a === '1.1.1.1' || a === '1.0.0.1') ? 'ok' : 'mismatch';
+    if (out.knownAnswer === 'mismatch') out.issues.push(`one.one.one.one resolved to ${addrs.join(', ')}`);
+  } catch {
+    out.knownAnswer = 'fail';
+    out.issues.push('Could not resolve one.one.one.one');
+  }
+
+  // DNS-over-HTTPS escape hatch: is 1.1.1.1 reachable directly?
+  try {
+    const { statusCode } = await httpsGet('https://1.1.1.1/dns-query?name=example.com&type=A', { accept: 'application/dns-json' });
+    out.dohReachable = statusCode === 200;
+  } catch {
+    out.dohReachable = false;
+  }
+  return out;
+}
+
+async function measureLatency(host = '1.1.1.1', port = 443, count = 10) {
+  const samples = [];
+  let lost = 0;
+  for (let i = 0; i < count; i++) {
+    const start = Date.now();
+    const ok = await tcpProbe(host, port, 2000);
+    if (ok) samples.push(Date.now() - start);
+    else lost++;
+    await new Promise(r => setTimeout(r, 120));
+  }
+  if (!samples.length) {
+    return { host, port, sent: count, lossPct: 100, minMs: null, avgMs: null, maxMs: null, jitterMs: null };
+  }
+  const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+  // Jitter as the mean absolute difference between consecutive samples.
+  let jitter = 0;
+  for (let i = 1; i < samples.length; i++) jitter += Math.abs(samples[i] - samples[i - 1]);
+  jitter = samples.length > 1 ? jitter / (samples.length - 1) : 0;
+  return {
+    host, port, sent: count,
+    lossPct: Math.round((lost / count) * 100),
+    minMs: Math.min(...samples),
+    avgMs: Math.round(avg * 10) / 10,
+    maxMs: Math.max(...samples),
+    jitterMs: Math.round(jitter * 10) / 10,
+  };
+}
+
+// portquiz.net accepts TCP on every port, so a failed connect means the
+// local network blocks that outbound port.
+const EGRESS_PORTS = [
+  { port: 22, label: 'SSH' },
+  { port: 25, label: 'SMTP' },
+  { port: 53, label: 'DNS/TCP' },
+  { port: 587, label: 'Mail submit' },
+  { port: 993, label: 'IMAPS' },
+  { port: 3389, label: 'RDP' },
+  { port: 8443, label: 'HTTPS-Alt' },
+];
+
+async function checkEgressPorts() {
+  return Promise.all(EGRESS_PORTS.map(async ({ port, label }) => ({
+    port, label, open: await tcpProbe('portquiz.net', port, 4000),
+  })));
+}
+
+async function runTravelChecks() {
+  const [portal, dnsIntegrity, latency, egress] = await Promise.all([
+    checkCaptivePortal(),
+    checkDnsIntegrity(),
+    measureLatency(),
+    checkEgressPorts(),
+  ]);
+  return { portal, dns: dnsIntegrity, latency, egress, checkedAt: new Date().toISOString() };
+}
+
+// ── SPEED TEST ───────────────────────────────────────────────────────────────
+// Cloudflare's speed endpoints need no API key. Download measures payload
+// bytes over wall time; upload posts random (incompressible) bytes.
+function speedtestDownload(bytes = 20000000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    let ttfb = null;
+    let received = 0;
+    const req = https.get(`https://speed.cloudflare.com/__down?bytes=${bytes}`, res => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      res.on('data', chunk => {
+        if (ttfb === null) ttfb = Date.now() - start;
+        received += chunk.length;
+      });
+      res.on('end', () => {
+        const seconds = (Date.now() - start) / 1000;
+        resolve({
+          bytes: received,
+          seconds: Math.round(seconds * 100) / 100,
+          mbps: Math.round((received * 8 / seconds / 1e6) * 10) / 10,
+          ttfbMs: ttfb,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function speedtestUpload(bytes = 5000000) {
+  return new Promise((resolve, reject) => {
+    const payload = crypto.randomBytes(bytes);
+    const start = Date.now();
+    const req = https.request({
+      hostname: 'speed.cloudflare.com',
+      path: '/__up',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': payload.length },
+    }, res => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      res.resume();
+      res.on('end', () => {
+        const seconds = (Date.now() - start) / 1000;
+        resolve({
+          bytes,
+          seconds: Math.round(seconds * 100) / 100,
+          mbps: Math.round((bytes * 8 / seconds / 1e6) * 10) / 10,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+let speedtestRunning = false;
+
 const sseClients = new Set();
 
 function broadcastSSE(data) {
@@ -1529,6 +1720,39 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(202, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'scanning' }));
     runScan().catch(console.error);
+    return;
+  }
+
+  if (url.pathname === '/api/travel/check' && req.method === 'POST') {
+    try {
+      const results = await runTravelChecks();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(results));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/travel/speedtest' && req.method === 'POST') {
+    if (speedtestRunning) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'A speed test is already running' }));
+      return;
+    }
+    speedtestRunning = true;
+    try {
+      const download = await speedtestDownload();
+      const upload = await speedtestUpload();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ download, upload, checkedAt: new Date().toISOString() }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Speed test failed: ${e.message}` }));
+    } finally {
+      speedtestRunning = false;
+    }
     return;
   }
 

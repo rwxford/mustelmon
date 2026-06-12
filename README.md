@@ -21,6 +21,7 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
 - **Tailscale network panel** — enter a Tailscale API key to fetch all devices on the tailnet: IPs, OS, online status, tags, advertised routes, client version, last-seen
 - **SSE-based live updates** — no polling from the browser; the server pushes bandwidth, scan, and Tailscale events over a persistent connection
 - **Optional authentication** — set `MUSTELMON_PASSWORD` to require a login; sessions are signed HttpOnly cookies
+- **Travel connectivity checks** — on-demand captive portal detection, DNS tampering tests, latency/jitter/loss measurement, outbound port checks, and a Cloudflare speed test for untrusted hotel/cafe Wi-Fi
 - **No build step** — single `server.js` + one HTML file, no npm packages required
 
 ---
@@ -85,6 +86,23 @@ See the [TrueNAS deployment section](#truenas-scale) below for full instructions
 4. Leave the tailnet field blank to use the default (`-`), or enter your tailnet name (e.g. `example.com`)
 
 The key is proxied through the server and never sent back to the browser. It is held in memory only and cleared on disconnect or restart.
+
+---
+
+## Travel connectivity checks
+
+The **Travel Connectivity** panel at the bottom of the dashboard is built for untrusted networks — hotel, cafe, airport, and conference Wi-Fi. Everything runs on demand from the machine hosting mustelmon; nothing runs automatically.
+
+**Run Checks** performs four tests in parallel (a few seconds total):
+
+| Check | How it works | What a failure means |
+|---|---|---|
+| Captive portal | Fetches `captive.apple.com` and `gstatic.com/generate_204` over plain HTTP and verifies the exact expected responses | A redirect or altered body means a portal intercepts traffic; the portal login URL is shown when available |
+| DNS integrity | A random nonexistent name must return NXDOMAIN; `one.one.one.one` must resolve to `1.1.1.1`/`1.0.0.1`; DNS-over-HTTPS to `1.1.1.1` is probed as an escape hatch | The network rewrites DNS answers (common on portals and hostile networks) |
+| Latency | 10 TCP connects to `1.1.1.1:443` → loss %, min/avg/max, jitter | High jitter or loss explains why calls and SSH sessions stutter |
+| Outbound ports | TCP connects to `portquiz.net` on 22, 25, 53, 587, 993, 3389, 8443 | Blocked ports — e.g. whether SSH or IMAP will work from this network |
+
+**Speed Test** measures download/upload throughput and TTFB against `speed.cloudflare.com`. It transfers roughly 20 MB down and 5 MB up, so avoid it on metered connections.
 
 ---
 
