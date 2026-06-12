@@ -1092,6 +1092,15 @@ function renderNetworkInfo() {
     },
   ];
 
+  // Wi-Fi link details are populated on macOS
+  if (networkInfo.wifi && networkInfo.wifi.ssid) {
+    const w = networkInfo.wifi;
+    rows.push({ label: 'Wi-Fi SSID', val: w.ssid });
+    if (w.channel) rows.push({ label: 'Wi-Fi Channel', val: w.channel });
+    if (w.signalNoise) rows.push({ label: 'Signal / Noise', val: w.signalNoise });
+    if (w.rate) rows.push({ label: 'Link Rate', val: w.rate });
+  }
+
   body.innerHTML = rows.map(r => `
     <div class="info-row">
       <span class="info-label">${r.label}</span>

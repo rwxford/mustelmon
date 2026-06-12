@@ -6,12 +6,80 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const os = require('os');
 const dns = require('dns').promises;
 const { execFile, exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+// ── PLATFORM LAYER ────────────────────────────────────────────────────────────
+// Linux reads /proc directly. macOS shells out to the BSD networking tools
+// (arp, netstat, route, sysctl) and parses their output. The parsers are pure
+// functions so they can be exercised against captured fixtures in test.js.
+const IS_DARWIN = process.platform === 'darwin';
+
+// macOS prints MAC octets without zero padding (e.g. 0:1c:b3:9:fa:d1).
+function normalizeMac(mac) {
+  if (!mac) return mac;
+  return mac.split(':').map(o => o.padStart(2, '0')).join(':').toLowerCase();
+}
+
+function netmaskToCidr(netmask) {
+  return netmask.split('.')
+    .map(Number)
+    .reduce((bits, octet) => bits + ((octet >>> 0).toString(2).match(/1/g) || []).length, 0);
+}
+
+// Parses `arp -an` output (macOS/BSD), e.g.
+//   ? (192.168.1.1) at 88:96:4e:3a:dd:1 on en0 ifscope [ethernet]
+//   ? (192.168.1.50) at (incomplete) on en0 ifscope [ethernet]
+// Incomplete, broadcast, and multicast entries are dropped.
+function parseArpOutput(stdout) {
+  const devices = {};
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-f:]+|\(incomplete\)) on (\S+)/i);
+    if (!m) continue;
+    const [, ip, rawMac, dev] = m;
+    if (rawMac === '(incomplete)') continue;
+    const mac = normalizeMac(rawMac);
+    if (mac === 'ff:ff:ff:ff:ff:ff' || mac === '00:00:00:00:00:00') continue;
+    const firstOctet = parseInt(ip.split('.')[0], 10);
+    if (firstOctet >= 224) continue; // multicast/reserved
+    devices[ip] = { ip, mac, dev, flags: 2, vendor: lookupVendor(mac) };
+  }
+  return devices;
+}
+
+// Parses `netstat -ib` output (macOS). Only <Link#N> rows carry interface
+// byte counters. Rows for interfaces without a MAC (e.g. lo0, utun) have one
+// fewer column than the header because the Address field is empty.
+function parseNetstatIb(stdout) {
+  const lines = stdout.trim().split('\n');
+  if (lines.length < 2) return {};
+  const header = lines[0].trim().split(/\s+/);
+  const netIdx = header.indexOf('Network');
+  const addrIdx = header.indexOf('Address');
+  const ibIdx = header.indexOf('Ibytes');
+  const obIdx = header.indexOf('Obytes');
+  if (netIdx === -1 || ibIdx === -1 || obIdx === -1) return {};
+  const counters = {};
+  for (const line of lines.slice(1)) {
+    const cols = line.trim().split(/\s+/);
+    if (!cols[netIdx] || !cols[netIdx].startsWith('<Link')) continue;
+    // Missing Address column shifts everything after it left by one.
+    const shift = cols.length === header.length ? 0 : cols.length === header.length - 1 ? 1 : null;
+    if (shift === null) continue;
+    const name = cols[0];
+    const rx = parseInt(cols[ibIdx - shift], 10);
+    const tx = parseInt(cols[obIdx - shift], 10);
+    if (Number.isNaN(rx) || Number.isNaN(tx)) continue;
+    const mac = shift === 0 && addrIdx !== -1 ? normalizeMac(cols[addrIdx]) : null;
+    counters[name] = { rx, tx, mac };
+  }
+  return counters;
+}
 
 // ── MAC OUI VENDOR MAP (common prefixes) ─────────────────────────────────────
 const OUI = {
@@ -408,6 +476,7 @@ async function refreshTailscale() {
 // ── ENVIRONMENT DETECTION ─────────────────────────────────────────────────────
 
 async function detectEnvironment() {
+  if (IS_DARWIN) return detectEnvironmentDarwin();
   const env = {
     runtime: 'unknown',       // kubernetes | docker | lxc | wsl | vm | bare-metal
     orchestrator: null,       // kubernetes | docker-compose | nomad | null
@@ -681,6 +750,102 @@ async function detectEnvironment() {
   return env;
 }
 
+// macOS host detection. Container/Kubernetes signals do not apply; this
+// reports the OS, hardware, interfaces, Wi-Fi link, and Tailscale presence.
+async function detectEnvironmentDarwin() {
+  const env = {
+    runtime: 'bare-metal',
+    orchestrator: null,
+    distribution: null,
+    workloadPlatform: null,
+    containerRuntime: null,
+    os: {},
+    hardware: {},
+    network: {},
+    kubernetes: null,
+    tailscale: null,
+    confidence: {},
+  };
+  const signals = ['darwin'];
+
+  try {
+    const { stdout } = await execAsync('sw_vers', { timeout: 5000 });
+    const name = stdout.match(/ProductName:\s*(.+)/)?.[1]?.trim();
+    const version = stdout.match(/ProductVersion:\s*(.+)/)?.[1]?.trim();
+    env.os = { name: [name, version].filter(Boolean).join(' ') || 'macOS', id: 'macos', version };
+  } catch {
+    env.os = { name: 'macOS', id: 'macos' };
+  }
+  try { env.os.kernel = (await execAsync('uname -r')).stdout.trim(); } catch {}
+
+  try {
+    const { stdout } = await execAsync('sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize', { timeout: 5000 });
+    const [cpu, cores, mem] = stdout.trim().split('\n');
+    env.hardware.cpu = cpu;
+    env.hardware.cores = parseInt(cores, 10) || null;
+    if (mem) env.hardware.memTotalMB = Math.round(parseInt(mem, 10) / 1024 / 1024);
+  } catch {}
+
+  // VM guest detection (UTM, Parallels, VMware): set to 1 inside guests.
+  try {
+    const { stdout } = await execAsync('sysctl -n kern.hv_vmm_present', { timeout: 3000 });
+    if (stdout.trim() === '1') {
+      env.runtime = 'vm';
+      signals.push('hv-vmm-present');
+    }
+  } catch {}
+  if (env.runtime === 'bare-metal') signals.push('no-container-signals');
+
+  try {
+    const { stdout } = await execAsync('ifconfig', { timeout: 5000 });
+    const ifaces = [];
+    for (const block of stdout.split(/\n(?=\S)/)) {
+      const nameMatch = block.match(/^(\S+?):/);
+      const mtuMatch = block.match(/mtu\s+(\d+)/);
+      if (!nameMatch) continue;
+      ifaces.push({
+        name: nameMatch[1],
+        mtu: mtuMatch ? parseInt(mtuMatch[1], 10) : null,
+        linkType: 'ether',
+        isVeth: false,
+        peerIdx: null,
+      });
+    }
+    env.network.interfaces = ifaces;
+    const primary = ifaces.find(i => i.name.startsWith('en'));
+    if (primary) {
+      env.network.primaryMTU = primary.mtu;
+      env.network.primaryLinkType = 'ether';
+    }
+  } catch {}
+
+  // The Tailscale CLI lives inside the app bundle unless symlinked into PATH.
+  for (const bin of ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']) {
+    try {
+      const { stdout } = await execAsync(`"${bin}" status --json`, { timeout: 3000 });
+      const ts = JSON.parse(stdout);
+      env.tailscale = {
+        detected: true,
+        self: ts.Self?.HostName,
+        ip: ts.Self?.TailscaleIPs?.[0],
+        domain: ts.MagicDNSSuffix || null,
+      };
+      signals.push('tailscale-cli');
+      break;
+    } catch {}
+  }
+
+  const wifi = await getWifiInfo();
+  if (wifi) {
+    env.network.wifi = wifi;
+    signals.push('wifi');
+  }
+
+  env.signals = signals;
+  env.detectedAt = new Date().toISOString();
+  return env;
+}
+
 let cachedEnvironment = null;
 
 async function getEnvironment() {
@@ -691,6 +856,7 @@ async function getEnvironment() {
 
 // ── NETWORK INFO ──────────────────────────────────────────────────────────────
 async function getNetworkInfo() {
+  if (IS_DARWIN) return getNetworkInfoDarwin();
   const info = { interfaces: [], gateway: null, dns: [], hostname: 'unknown', subnet: null };
 
   // Hostname
@@ -759,6 +925,96 @@ async function getNetworkInfo() {
   return info;
 }
 
+async function getNetworkInfoDarwin() {
+  const info = { interfaces: [], gateway: null, dns: [], hostname: 'unknown', subnet: null };
+
+  try { info.hostname = (await execAsync('hostname')).stdout.trim(); } catch {}
+
+  let counters = {};
+  try {
+    counters = parseNetstatIb((await execAsync('netstat -ib', { timeout: 5000 })).stdout);
+  } catch {}
+
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (name === 'lo0') continue;
+    const v4 = (addrs || []).find(a => a.family === 'IPv4' && !a.internal);
+    if (!v4) continue;
+    info.interfaces.push({
+      name,
+      ip: v4.address,
+      cidr: netmaskToCidr(v4.netmask),
+      mac: v4.mac && v4.mac !== '00:00:00:00:00:00' ? v4.mac : (counters[name]?.mac || null),
+      rx: counters[name]?.rx || 0,
+      tx: counters[name]?.tx || 0,
+    });
+  }
+
+  // Gateway and primary interface come from the default route.
+  let defaultIface = null;
+  try {
+    const { stdout } = await execAsync('route -n get default', { timeout: 5000 });
+    const gw = stdout.match(/gateway:\s*(\d+\.\d+\.\d+\.\d+)/);
+    if (gw) info.gateway = gw[1];
+    defaultIface = stdout.match(/interface:\s*(\S+)/)?.[1] || null;
+  } catch {}
+
+  // Put the default-route interface first so scans target the LAN rather
+  // than a VPN/utun interface. runScan() always uses the first interface.
+  if (defaultIface) {
+    info.interfaces.sort((a, b) => (a.name === defaultIface ? -1 : b.name === defaultIface ? 1 : 0));
+  }
+  const primary = info.interfaces[0];
+  if (primary && primary.ip && primary.cidr) {
+    info.subnet = cidrToSubnet(primary.ip, primary.cidr);
+  }
+
+  // /etc/resolv.conf is auto-generated on macOS and lists the active resolvers.
+  try {
+    const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const ns = resolv.match(/^nameserver\s+(.+)$/mg);
+    if (ns) info.dns = ns.map(l => l.replace('nameserver', '').trim());
+    const search = resolv.match(/^search\s+(.+)$/m);
+    if (search) info.dnsSearch = search[1].trim().split(/\s+/);
+  } catch {}
+
+  const wifi = await getWifiInfo();
+  if (wifi) info.wifi = wifi;
+
+  return info;
+}
+
+// system_profiler is the only SSID source that works unprivileged on recent
+// macOS, but it takes 1-4s, so results are cached for 60 seconds.
+let wifiCache = { data: null, ts: 0 };
+
+async function getWifiInfo() {
+  if (!IS_DARWIN) return null;
+  if (Date.now() - wifiCache.ts < 60000) return wifiCache.data;
+  let data = null;
+  try {
+    const { stdout } = await execAsync('system_profiler SPAirPortDataType -json', {
+      timeout: 15000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const root = JSON.parse(stdout).SPAirPortDataType?.[0];
+    const ifaces = root?.spairport_airport_interfaces || [];
+    const active = ifaces.find(i => i.spairport_current_network_information);
+    const cur = active?.spairport_current_network_information;
+    if (cur) {
+      data = {
+        interface: active._name || null,
+        ssid: cur._name || null,
+        channel: cur.spairport_network_channel || null,
+        signalNoise: cur.spairport_signal_noise || null,
+        rate: cur.spairport_network_rate ? `${cur.spairport_network_rate} Mbps` : null,
+        security: cur.spairport_security_mode || null,
+      };
+    }
+  } catch {}
+  wifiCache = { data, ts: Date.now() };
+  return data;
+}
+
 function cidrToSubnet(ip, cidr) {
   const parts = ip.split('.').map(Number);
   const mask = ~((1 << (32 - cidr)) - 1) >>> 0;
@@ -781,7 +1037,15 @@ function subnetIPs(ip, cidr) {
 }
 
 // ── ARP TABLE ─────────────────────────────────────────────────────────────────
-function readArpTable() {
+async function readArpTable() {
+  if (IS_DARWIN) {
+    try {
+      const { stdout } = await execAsync('arp -an', { timeout: 5000 });
+      return parseArpOutput(stdout);
+    } catch {
+      return {};
+    }
+  }
   const devices = {};
   try {
     const raw = fs.readFileSync('/proc/net/arp', 'utf8');
@@ -867,7 +1131,7 @@ async function runScan() {
   if (!myIP) return;
 
   // First, read ARP table to get already-known devices
-  const arpEntries = readArpTable();
+  const arpEntries = await readArpTable();
 
   // Scan subnet IPs to populate ARP
   const allIPs = subnetIPs(myIP, cidr);
@@ -895,7 +1159,7 @@ async function runScan() {
       }
     }));
     // Re-read ARP after each batch (TCP connects populate it)
-    const fresh = readArpTable();
+    const fresh = await readArpTable();
     Object.assign(arpEntries, fresh);
   }
 
@@ -941,29 +1205,40 @@ async function runScan() {
 }
 
 // ── BANDWIDTH MONITORING ──────────────────────────────────────────────────────
-function updateBandwidth() {
-  try {
-    const raw = fs.readFileSync('/proc/net/dev', 'utf8');
-    const lines = raw.trim().split('\n').slice(2);
-    const now = Date.now();
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/);
-      const name = parts[0].replace(':', '');
-      const rx = parseInt(parts[1]);
-      const tx = parseInt(parts[9]);
-      if (lastBandwidth[name]) {
-        const dt = (now - lastBandwidth[name].ts) / 1000;
-        if (dt > 0) {
-          bandwidthRates[name] = {
-            rxRate: Math.max(0, (rx - lastBandwidth[name].rx) / dt),
-            txRate: Math.max(0, (tx - lastBandwidth[name].tx) / dt),
-            rxTotal: rx, txTotal: tx,
-          };
-        }
+async function updateBandwidth() {
+  const now = Date.now();
+  const counters = {};
+  if (IS_DARWIN) {
+    try {
+      const { stdout } = await execAsync('netstat -ib', { timeout: 5000 });
+      for (const [name, c] of Object.entries(parseNetstatIb(stdout))) {
+        counters[name] = { rx: c.rx, tx: c.tx };
       }
-      lastBandwidth[name] = { rx, tx, ts: now };
+    } catch {}
+  } else {
+    try {
+      const raw = fs.readFileSync('/proc/net/dev', 'utf8');
+      const lines = raw.trim().split('\n').slice(2);
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        const name = parts[0].replace(':', '');
+        counters[name] = { rx: parseInt(parts[1]), tx: parseInt(parts[9]) };
+      }
+    } catch {}
+  }
+  for (const [name, { rx, tx }] of Object.entries(counters)) {
+    if (lastBandwidth[name]) {
+      const dt = (now - lastBandwidth[name].ts) / 1000;
+      if (dt > 0) {
+        bandwidthRates[name] = {
+          rxRate: Math.max(0, (rx - lastBandwidth[name].rx) / dt),
+          txRate: Math.max(0, (tx - lastBandwidth[name].tx) / dt),
+          rxTotal: rx, txTotal: tx,
+        };
+      }
     }
-  } catch {}
+    lastBandwidth[name] = { rx, tx, ts: now };
+  }
   broadcastSSE({ type: 'bandwidth', rates: bandwidthRates });
 }
 
@@ -1117,6 +1392,14 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
+// Pure helpers are exported so test.js can exercise them without starting
+// the server. `node server.js` still starts normally.
+module.exports = {
+  parseArpOutput, parseNetstatIb, normalizeMac, netmaskToCidr,
+  cidrToSubnet, subnetIPs, lookupVendor, parseSshOs,
+};
+
+if (require.main === module) {
 server.listen(PORT, () => {
   console.log(`Network Monitor running at http://localhost:${PORT}`);
 
@@ -1133,9 +1416,9 @@ server.listen(PORT, () => {
   // Periodic updates
   setInterval(updateBandwidth, 2000);
   setInterval(checkConnectivity, 15000);
-  setInterval(() => {
+  setInterval(async () => {
     // Refresh ARP + quick re-check of known devices
-    const arp = readArpTable();
+    const arp = await readArpTable();
     const now = Date.now();
     for (const [ip, entry] of Object.entries(arp)) {
       if (ip.startsWith('127.') || ip === '::1') continue;
@@ -1155,3 +1438,4 @@ server.listen(PORT, () => {
   // Tailscale refresh every 60 seconds (if key is set)
   setInterval(() => refreshTailscale().catch(console.error), 60000);
 });
+}

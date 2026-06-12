@@ -2,7 +2,7 @@
 
 > Real-time network monitor with device fingerprinting, service identification, and Tailscale integration.
 
-Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernetes, or a Coder workspace.
+Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernetes, a Coder workspace, or natively on macOS.
 
 ---
 
@@ -15,7 +15,7 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
   - TCP banner probing → Redis, PostgreSQL, MySQL, MongoDB, etcd
   - DNS reverse-lookup hostname patterns → maps K8s pod names to their service type
 - **Service chips** — colour-coded badges per device: Argo CD, Grafana, Prometheus, GitLab, Loki, Traefik, cert-manager, CoreDNS, Sealed Secrets, MinIO, and more
-- **Live bandwidth** — per-interface RX/TX rates from `/proc/net/dev`, updated every 2 seconds
+- **Live bandwidth** — per-interface RX/TX rates from `/proc/net/dev` (Linux) or `netstat` (macOS), updated every 2 seconds
 - **Internet connectivity** — TCP checks to Cloudflare and Google DNS with latency
 - **Environment detection** — automatically identifies whether it is running inside Kubernetes (and which distribution: K3s, EKS, GKE, AKS…), Docker, a VM, WSL, or bare metal. Decodes the Kubernetes service account JWT, reads cluster CIDR ranges, fingerprints the overlay MTU (VXLAN/Flannel = 1450, WireGuard = 1410, IPIP = 1480), and detects workload platforms (Coder, Gitpod, Codespaces)
 - **Tailscale network panel** — enter a Tailscale API key to fetch all devices on the tailnet: IPs, OS, online status, tags, advertised routes, client version, last-seen
@@ -28,7 +28,7 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
 
 ### Option 1 — Node.js directly
 
-Requires Node.js 18 or later.
+Requires Node.js 18 or later. Works on Linux and macOS.
 
 ```bash
 git clone https://github.com/rwxford/mustelmon.git
@@ -37,6 +37,12 @@ node server.js
 ```
 
 Open http://localhost:3000.
+
+On macOS this is the recommended way to run mustelmon. Docker Desktop on
+macOS cannot use `--network host` (containers run inside a VM and only see
+the VM's network), so the container options below are Linux-only. The native
+macOS build reads the ARP table via `arp -an`, bandwidth via `netstat -ib`,
+and shows the current Wi-Fi network (SSID, channel, signal) in the dashboard.
 
 ### Option 2 — Docker
 
@@ -116,27 +122,24 @@ On startup mustelmon probes the local environment and displays a banner showing 
 | Requirement | Notes |
 |---|---|
 | Node.js ≥ 18 | No npm packages needed |
-| Linux | Reads `/proc/net/arp`, `/proc/net/dev`, `/proc/cpuinfo` |
+| Linux or macOS | Linux reads `/proc/net/*`; macOS shells out to `arp`, `netstat`, `route`, and `sysctl` |
 | Network access | Must be able to reach the subnet being scanned |
-| Port 3000 | Configurable by changing `PORT` in `server.js` |
+| Port 3000 | Configurable via the `PORT` environment variable |
 
-macOS and Windows are not currently supported because the network scanning relies on Linux `/proc` interfaces.
+Windows is not currently supported. On macOS, run with Node directly rather
+than Docker (see Quick start).
 
 ---
 
 ## Configuration
 
-There is no config file. The only thing you may want to change is the port:
+There is no config file. The port is set via the `PORT` environment variable:
 
 ```bash
 PORT=8080 node server.js
 ```
 
-Or edit the constant at the top of `server.js`:
-
-```js
-const PORT = 3000;
-```
+It defaults to 3000.
 
 ---
 
@@ -147,6 +150,7 @@ mustelmon/
 ├── server.js          # HTTP server, scanner, fingerprinter, Tailscale proxy
 ├── public/
 │   └── index.html     # Single-page dashboard (no framework, no build step)
+├── test.js            # Zero-dependency tests for the platform parsers
 ├── Dockerfile
 ├── docker-compose.yml
 ├── k8s.yaml
