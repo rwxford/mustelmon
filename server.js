@@ -464,8 +464,10 @@ async function runFingerprintAll() {
       try {
         const fp = await fingerprintDevice(d);
         d.fingerprint = fp;
+        // Self is labelled from local platform detection; banner/header
+        // fingerprints (often the monitor's own HTTP server) must not relabel it.
         if (fp.os && !d.os) d.os = fp.os;
-        if (fp.osIcon) d.osIcon = fp.osIcon;
+        if (fp.osIcon && !d.isSelf) d.osIcon = fp.osIcon;
         if (fp.services.length) d.services = fp.services;
         if (fp.confidence) d.fpConfidence = fp.confidence;
       } catch {}
@@ -1263,15 +1265,19 @@ async function runScan() {
   delete devices['::1'];
 
   // Mark self
+  const selfOs = IS_DARWIN ? 'macOS' : null;
+  const selfOsIcon = IS_DARWIN ? '🍎' : null;
   if (devices[myIP]) {
     devices[myIP].isSelf = true;
     devices[myIP].hostname = networkInfo.hostname;
     devices[myIP].reachable = true;
+    if (selfOs) { devices[myIP].os = selfOs; devices[myIP].osIcon = selfOsIcon; }
   } else {
     devices[myIP] = {
       ip: myIP, mac: networkInfo.interfaces.find(i=>i.ip===myIP)?.mac,
       hostname: networkInfo.hostname, isSelf: true,
       reachable: true, lastSeen: Date.now(), firstSeen: Date.now(),
+      os: selfOs, osIcon: selfOsIcon,
       vendor: lookupVendor(networkInfo.interfaces.find(i=>i.ip===myIP)?.mac || ''),
     };
   }

@@ -1169,7 +1169,8 @@ function renderNetworkInfo() {
 
 function renderBandwidth(rates) {
   const body = document.getElementById('bandwidth-body');
-  const ifaces = Object.entries(rates).filter(([k]) => k !== 'lo');
+  // Drop loopback on every platform: `lo` on Linux, `lo0` on macOS.
+  const ifaces = Object.entries(rates).filter(([k]) => !/^lo\d*$/.test(k));
 
   if (!ifaces.length) {
     body.innerHTML = '<div style="color:var(--text-dim);font-size:12px">No data yet...</div>';
@@ -1186,7 +1187,7 @@ function renderBandwidth(rates) {
   body.innerHTML = ifaces.map(([name, r]) => `
     <div class="bw-interface">
       <div class="bw-name">
-        <span style="color:var(--cyan)">eth</span> ${name}
+        <span style="color:var(--cyan)">${name}</span>
         <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">
           Total: ${fmtBytes(r.rxTotal)} in / ${fmtBytes(r.txTotal)} out
         </span>
