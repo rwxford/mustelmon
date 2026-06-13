@@ -1097,6 +1097,7 @@ function renderDevices() {
               <div class="device-hostname">${shortHost}${d.isSelf ? ' <span class="device-self-badge">YOU</span>' : ''}</div>
               ${d.hostname && d.hostname !== d.ip && d.hostname !== shortHost
                 ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.hostname.replace(/\.svc\.cluster\.local$/,'')}</div>` : ''}
+              ${d.mac ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.mac}${d.vendor && d.vendor !== 'Unknown' ? ' · ' + d.vendor : ''}</div>` : ''}
             </div>
           </div>
         </td>
