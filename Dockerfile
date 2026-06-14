@@ -3,7 +3,7 @@ FROM node:22-alpine
 WORKDIR /app
 
 # Copy application files (no node_modules needed — zero dependencies)
-COPY package.json server.js ./
+COPY package.json server.js oui.js ./
 COPY public/ ./public/
 
 EXPOSE 3000
