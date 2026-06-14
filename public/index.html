@@ -1147,6 +1147,7 @@ function renderDevices() {
             <div class="device-icon ${cls}">${icon}</div>
             <div>
               <div class="device-hostname">${shortHost}${d.isSelf ? ' <span class="device-self-badge">YOU</span>' : ''}</div>
+              ${(d.friendlyName || d.model || d.categoryLabel) ? `<div style="font-size:10px;color:var(--cyan)">${[d.friendlyName, d.model, d.categoryLabel].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i).join(' · ')}</div>` : ''}
               ${d.hostname && d.hostname !== d.ip && d.hostname !== shortHost
                 ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.hostname.replace(/\.svc\.cluster\.local$/,'')}</div>` : ''}
               ${d.mac ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.mac}${d.vendor && d.vendor !== 'Unknown' ? ' · ' + d.vendor : ''}</div>` : ''}
@@ -1894,6 +1895,9 @@ function renderDeviceInfo() {
   h += ddRow('IP', d.ip);
   if (d.mac) h += ddRow('MAC', d.mac);
   if (d.vendor && d.vendor !== 'Unknown') h += ddRow('Vendor', d.vendor);
+  if (d.friendlyName) h += ddRow('Name', d.friendlyName);
+  if (d.model) h += ddRow('Model', d.model);
+  if (d.categoryLabel || d.deviceCategory) h += ddRow('Type', d.categoryLabel || d.deviceCategory);
   if (d.hostname && d.hostname !== d.ip) h += ddRow('Hostname', d.hostname);
   h += ddRow('OS', (d.osIcon ? d.osIcon + ' ' : '') + (d.os || 'Unknown'));
   h += ddRow('Status', d.reachable ? 'Online' : 'Offline');
@@ -1918,6 +1922,13 @@ function renderDeviceInfo() {
   if (d.services && d.services.length) {
     h += '<div class="dd-section"><h4>Services</h4>';
     h += d.services.map(s => ddRow(s.name + (s.port ? ' :' + s.port : ''), s.version || s.banner || '')).join('');
+    h += '</div>';
+  }
+
+  if (d.mdns && d.mdns.services && d.mdns.services.length) {
+    h += '<div class="dd-section"><h4>mDNS services</h4>';
+    h += '<div class="dd-ports">' + d.mdns.services.map(s =>
+      `<span class="dd-port" style="background:rgba(57,197,207,0.12);color:var(--cyan);border-color:rgba(57,197,207,0.3)">${s}</span>`).join('') + '</div>';
     h += '</div>';
   }
 

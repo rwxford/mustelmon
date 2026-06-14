@@ -160,6 +160,7 @@ function recordLoginFailure(ip) {
 
 // ── MAC OUI VENDOR LOOKUP ─────────────────────────────────────
 const { oui: OUI, prefixes: OUI_PREFIXES } = require('./oui');
+const mdns = require('./mdns.js');
 
 function lookupVendor(mac) {
   if (!mac || mac === '00:00:00:00:00:00') return 'Unknown';
@@ -168,6 +169,10 @@ function lookupVendor(mac) {
   for (const [prefix, vendor] of Object.entries(OUI_PREFIXES)) {
     if (oui6.startsWith(prefix)) return vendor;
   }
+  // The locally-administered bit (0x02 in the first octet) marks randomized or
+  // private MACs, which have no registered vendor by design.
+  const firstOctet = parseInt(oui6.slice(0, 2), 16);
+  if (Number.isFinite(firstOctet) && (firstOctet & 0x02)) return 'Randomized MAC';
   return 'Unknown';
 }
 
@@ -1267,6 +1272,32 @@ async function runScan() {
   broadcastSSE({ type: 'scanComplete', deviceCount: Object.keys(devices).length });
   // Kick off fingerprinting on newly discovered devices
   runFingerprintAll().catch(console.error);
+  // Best-effort mDNS enrichment; link-local only, so it may see nothing on a
+  // segmented network. Runs in the background and broadcasts when it lands.
+  enrichWithMdns(myIP).catch(() => {});
+}
+
+// Merges mDNS discovery results into known devices: advertised services, a
+// device category, and (when published) an exact model and friendly name.
+async function enrichWithMdns(interfaceAddress) {
+  let found;
+  try {
+    found = await mdns.discover({ timeoutMs: 2500, interfaceAddress });
+  } catch {
+    return;
+  }
+  let changed = false;
+  for (const [ip, info] of Object.entries(found)) {
+    const d = devices[ip];
+    if (!d) continue;
+    d.mdns = { services: info.services, model: info.model, name: info.name };
+    if (info.category) d.deviceCategory = info.category;
+    if (info.categoryLabel) d.categoryLabel = info.categoryLabel;
+    if (info.model && !d.model) d.model = info.model;
+    if (info.name && !d.friendlyName) d.friendlyName = info.name;
+    changed = true;
+  }
+  if (changed) broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
 }
 
 // ── BANDWIDTH MONITORING ──────────────────────────────────────────────────────

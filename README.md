@@ -194,6 +194,7 @@ Notes:
 mustelmon/
 ├── server.js          # HTTP server, scanner, fingerprinter, Tailscale proxy
 ├── oui.js             # Generated MAC OUI -> vendor map (see scripts/build-oui.js)
+├── mdns.js            # Zero-dependency mDNS/Bonjour discovery
 ├── public/
 │   ├── index.html     # Single-page dashboard (no framework, no build step)
 │   └── login.html     # Login page (used when MUSTELMON_PASSWORD is set)

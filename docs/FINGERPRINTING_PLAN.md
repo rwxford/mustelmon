@@ -111,6 +111,13 @@ vendor; `lookupVendor` unit tests cover representative prefixes.
 
 ## Phase 2: mDNS / Bonjour discovery
 
+Status: **done** (commit on `travel-features`). Implemented in `mdns.js`
+(pure DNS codec + `discover()`), wired into the scan via `enrichWithMdns()`,
+and surfaced in the device table and drawer (category, model, friendly
+name, advertised service types). Codec and classifier are unit-tested in
+`test.js`. Discovery is link-local and best-effort, so it stays quiet on a
+segmented network until mustelmon shares the device's segment.
+
 Objective: identify Apple TV/HomePod, Echo/Alexa, Chromecast/Nest, HomeKit
 accessories, printers, and Sonos, often with model and friendly name.
 

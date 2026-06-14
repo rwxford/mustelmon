@@ -9,6 +9,7 @@ const {
   parseArpOutput, parseNetstatIb, normalizeMac, netmaskToCidr,
   cidrToSubnet, subnetIPs, lookupVendor,
 } = require('./server.js');
+const mdns = require('./mdns.js');
 
 let passed = 0;
 let failed = 0;
@@ -132,10 +133,63 @@ test('lookupVendor matches locally-administered prefixes', () => {
   assert.strictEqual(lookupVendor('02:42:ac:11:00:02'), 'Docker');
   assert.strictEqual(lookupVendor('52:54:00:12:34:56'), 'QEMU/KVM');
 });
+test('lookupVendor flags locally-administered MACs as Randomized MAC', () => {
+  assert.strictEqual(lookupVendor('aa:bb:cc:dd:ee:ff'), 'Randomized MAC');
+  assert.strictEqual(lookupVendor('da:d5:6d:8e:62:e7'), 'Randomized MAC');
+});
 test('lookupVendor returns Unknown for unmapped or empty MACs', () => {
   assert.strictEqual(lookupVendor(''), 'Unknown');
   assert.strictEqual(lookupVendor('00:00:00:00:00:00'), 'Unknown');
-  assert.strictEqual(lookupVendor('de:ad:be:ef:00:01'), 'Unknown');
+  assert.strictEqual(lookupVendor('f8:ff:ff:00:00:01'), 'Unknown');
+});
+
+// ── mDNS codec ──────────────────────────────────────────────────────
+test('mdns.encodeName encodes length-prefixed labels', () => {
+  assert.deepStrictEqual(mdns.encodeName('_ipp._tcp.local'),
+    Buffer.from([4, 0x5f, 0x69, 0x70, 0x70, 4, 0x5f, 0x74, 0x63, 0x70, 5, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0]));
+});
+test('mdns.encodeQuery sets QDCOUNT and PTR/IN', () => {
+  const q = mdns.encodeQuery(['_airplay._tcp.local']);
+  assert.strictEqual(q.readUInt16BE(4), 1); // QDCOUNT
+  assert.strictEqual(q[q.length - 4], 0x00);
+  assert.strictEqual(q[q.length - 3], 12); // QTYPE PTR
+  assert.strictEqual(q[q.length - 1], 1);  // QCLASS IN
+});
+test('mdns.decodeName follows compression pointers', () => {
+  // "local" at offset 0, then "x" + pointer to offset 0.
+  const buf = Buffer.from([5, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0, 1, 0x78, 0xc0, 0x00]);
+  assert.strictEqual(mdns.decodeName(buf, 7).name, 'x.local');
+});
+test('mdns.parseTxt splits key=value records', () => {
+  const txt = Buffer.concat([
+    Buffer.from([10]), Buffer.from('model=J305'),
+    Buffer.from([5]), Buffer.from('fn=TV'),
+  ]);
+  assert.deepStrictEqual(mdns.parseTxt(txt), { model: 'J305', fn: 'TV' });
+});
+test('mdns.decodeMessage parses an A record', () => {
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(0x8400, 2); // response
+  header.writeUInt16BE(1, 6);      // ANCOUNT
+  const rr = Buffer.concat([
+    mdns.encodeName('apple-tv.local'),
+    Buffer.from([0x00, 0x01, 0x80, 0x01, 0, 0, 0, 60, 0x00, 0x04, 192, 168, 1, 50]),
+  ]);
+  const { answers } = mdns.decodeMessage(Buffer.concat([header, rr]));
+  assert.strictEqual(answers.length, 1);
+  assert.strictEqual(answers[0].data, '192.168.1.50');
+});
+test('mdns.summarize resolves an Apple TV to media + model', () => {
+  const out = mdns.summarize([
+    { type: 12, name: '_airplay._tcp.local', data: 'Living Room._airplay._tcp.local' },
+    { type: 33, name: 'Living Room._airplay._tcp.local', target: 'lr.local', port: 7000 },
+    { type: 16, name: 'Living Room._airplay._tcp.local', txt: { model: 'AppleTV6,2' } },
+    { type: 1, name: 'lr.local', data: '192.168.1.50' },
+  ]);
+  assert.deepStrictEqual(out['192.168.1.50'], {
+    services: ['_airplay._tcp'], model: 'AppleTV6,2', name: 'Living Room',
+    category: 'media', categoryLabel: 'AirPlay',
+  });
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
