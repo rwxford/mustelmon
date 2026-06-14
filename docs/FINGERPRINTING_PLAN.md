@@ -71,6 +71,13 @@ route interface already computed for scanning).
 
 ## Phase 1: Expand the OUI database
 
+Status: **done** (commit on `travel-features`). Implemented as a generated
+`oui.js` (~7,100 curated IEEE prefixes) plus `scripts/build-oui.js`, wired
+into `lookupVendor()` with `lookupVendor` unit tests in `test.js`. Vendor
+rules are anchored to organization-name starts to avoid false positives
+(e.g. "Engineering LLC" matching Ring, or Brazilian "Amazonia" companies
+matching Amazon).
+
 Objective: turn most `Unknown` vendors into a real manufacturer.
 
 Approach:

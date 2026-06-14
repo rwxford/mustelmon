@@ -7,7 +7,7 @@
 const assert = require('assert');
 const {
   parseArpOutput, parseNetstatIb, normalizeMac, netmaskToCidr,
-  cidrToSubnet, subnetIPs,
+  cidrToSubnet, subnetIPs, lookupVendor,
 } = require('./server.js');
 
 let passed = 0;
@@ -114,6 +114,28 @@ test('cidrToSubnet computes the network address', () => {
 test('subnetIPs caps the host count at 254', () => {
   assert.strictEqual(subnetIPs('192.168.4.31', 24).length, 254);
   assert.strictEqual(subnetIPs('192.168.4.31', 30).length, 2);
+});
+
+// ── lookupVendor ──────────────────────────────────────────────────────────────
+test('lookupVendor resolves IEEE OUI prefixes', () => {
+  assert.strictEqual(lookupVendor('00:71:47:aa:bb:cc'), 'Amazon');
+  assert.strictEqual(lookupVendor('00:03:93:11:22:33'), 'Apple');
+  assert.strictEqual(lookupVendor('00:0d:4b:11:22:33'), 'Roku');
+  assert.strictEqual(lookupVendor('00:04:3c:11:22:33'), 'Sonos');
+  assert.strictEqual(lookupVendor('00:4b:12:11:22:33'), 'Espressif');
+  assert.strictEqual(lookupVendor('00:b4:63:11:22:33'), 'Ring');
+});
+test('lookupVendor is case-insensitive', () => {
+  assert.strictEqual(lookupVendor('00:0D:4B:AA:BB:CC'), 'Roku');
+});
+test('lookupVendor matches locally-administered prefixes', () => {
+  assert.strictEqual(lookupVendor('02:42:ac:11:00:02'), 'Docker');
+  assert.strictEqual(lookupVendor('52:54:00:12:34:56'), 'QEMU/KVM');
+});
+test('lookupVendor returns Unknown for unmapped or empty MACs', () => {
+  assert.strictEqual(lookupVendor(''), 'Unknown');
+  assert.strictEqual(lookupVendor('00:00:00:00:00:00'), 'Unknown');
+  assert.strictEqual(lookupVendor('de:ad:be:ef:00:01'), 'Unknown');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

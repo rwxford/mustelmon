@@ -193,15 +193,24 @@ Notes:
 ```
 mustelmon/
 ├── server.js          # HTTP server, scanner, fingerprinter, Tailscale proxy
+├── oui.js             # Generated MAC OUI -> vendor map (see scripts/build-oui.js)
 ├── public/
 │   ├── index.html     # Single-page dashboard (no framework, no build step)
 │   └── login.html     # Login page (used when MUSTELMON_PASSWORD is set)
-├── test.js            # Zero-dependency tests for the platform parsers
+├── scripts/
+│   └── build-oui.js   # Regenerates oui.js from the IEEE OUI registry
+├── test.js            # Zero-dependency tests for the pure helpers
+├── docs/
+│   └── FINGERPRINTING_PLAN.md  # Roadmap for device identification
 ├── Dockerfile
 ├── docker-compose.yml
 ├── k8s.yaml
 └── package.json
 ```
+
+The MAC vendor lookup uses `oui.js`, a curated subset of the public IEEE OUI
+registry covering common consumer and IoT vendors. It is committed so the app
+stays build-free; regenerate it with `node scripts/build-oui.js`.
 
 ---
 

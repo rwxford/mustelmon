@@ -158,33 +158,15 @@ function recordLoginFailure(ip) {
   loginFailures.set(ip, f);
 }
 
-// ── MAC OUI VENDOR MAP (common prefixes) ─────────────────────────────────────
-const OUI = {
-  '00:50:56': 'VMware', '00:0c:29': 'VMware', '00:1c:14': 'VMware',
-  '52:54:00': 'QEMU/KVM', 'fa:16:3e': 'OpenStack',
-  '02:42': 'Docker', '00:16:3e': 'Xen',
-  'aa:bb:cc': 'Virtual',
-  '00:1a:11': 'Google', 'f4:f5:d8': 'Google',
-  'b8:27:eb': 'Raspberry Pi', 'dc:a6:32': 'Raspberry Pi', 'e4:5f:01': 'Raspberry Pi',
-  '00:17:88': 'Philips Hue', '00:1e:06': 'Wibrain',
-  'b8:31:b5': 'Apple', '3c:07:54': 'Apple', 'a4:c3:f0': 'Apple',
-  '38:f9:d3': 'Apple', 'f0:18:98': 'Apple', '00:1b:63': 'Apple',
-  '00:25:00': 'Apple', '00:26:08': 'Apple',
-  'ac:bc:32': 'Apple', '04:0c:ce': 'Apple',
-  '00:1d:0f': 'ASIX Electronics',
-  '5a:83:65': 'Virtual Router',
-  'c6:92:08': 'Container/VM',
-  '00:00:00': 'Unknown',
-};
+// ── MAC OUI VENDOR LOOKUP ─────────────────────────────────────
+const { oui: OUI, prefixes: OUI_PREFIXES } = require('./oui');
 
 function lookupVendor(mac) {
   if (!mac || mac === '00:00:00:00:00:00') return 'Unknown';
-  const parts = mac.toLowerCase().split(':');
-  const oui6 = parts.slice(0, 3).join(':');
-  const oui4 = parts.slice(0, 2).join(':');
-  for (const [prefix, vendor] of Object.entries(OUI)) {
-    if (oui6.startsWith(prefix.toLowerCase())) return vendor;
-    if (oui4 === prefix.toLowerCase()) return vendor;
+  const oui6 = mac.toLowerCase().split(':').slice(0, 3).join(':');
+  if (OUI[oui6]) return OUI[oui6];
+  for (const [prefix, vendor] of Object.entries(OUI_PREFIXES)) {
+    if (oui6.startsWith(prefix)) return vendor;
   }
   return 'Unknown';
 }
