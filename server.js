@@ -1536,6 +1536,42 @@ function speedtestUpload(bytes = 5000000) {
 
 let speedtestRunning = false;
 
+// ── DEVICE DETAIL ACTIONS ─────────────────────────────────────────────────────
+// On-demand probes for the device drawer. Every action is restricted to an IP
+// already discovered on the local network (present in the devices map). Without
+// that guard these authenticated endpoints would be an arbitrary port-scan/SSRF
+// proxy.
+function readJsonBody(req, limit = 1 << 20) {
+  return new Promise(resolve => {
+    let body = '';
+    req.on('data', d => { body += d; if (body.length > limit) req.destroy(); });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch { resolve(null); } });
+    req.on('error', () => resolve(null));
+  });
+}
+
+function knownDevice(ip) {
+  return ip && Object.prototype.hasOwnProperty.call(devices, ip) ? devices[ip] : null;
+}
+
+async function firstReachablePort(ip, ports) {
+  for (const p of ports) {
+    if (await tcpProbe(ip, p, 800)) return p;
+  }
+  return null;
+}
+
+async function devicePortScan(ip, maxPort = 1024, concurrency = 100) {
+  const open = [];
+  for (let start = 1; start <= maxPort; start += concurrency) {
+    const batch = [];
+    for (let p = start; p < start + concurrency && p <= maxPort; p++) batch.push(p);
+    const results = await Promise.all(batch.map(async p => (await tcpProbe(ip, p, 500)) ? p : -1));
+    for (const p of results) if (p !== -1) open.push(p);
+  }
+  return open;
+}
+
 const sseClients = new Set();
 
 function broadcastSSE(data) {
@@ -1726,6 +1762,66 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(202, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'scanning' }));
     runScan().catch(console.error);
+    return;
+  }
+
+  if (url.pathname === '/api/device/ping' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const candidates = (dev.openPorts && dev.openPorts.length) ? dev.openPorts : [80, 443, 22, 53, 8080, 445, 7];
+    const port = (await firstReachablePort(ip, candidates)) || candidates[0];
+    const result = await measureLatency(ip, port, 10);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  if (url.pathname === '/api/device/rescan' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    try {
+      const arp = await readArpTable();
+      if (arp[ip]) { dev.mac = arp[ip].mac || dev.mac; dev.vendor = arp[ip].vendor || dev.vendor; }
+      const fp = await fingerprintDevice(dev);
+      dev.fingerprint = fp;
+      if (fp.services.length) dev.services = fp.services;
+      if (fp.confidence) dev.fpConfidence = fp.confidence;
+      // An explicit rescan may relabel the OS, but never the local host.
+      if (!dev.isSelf) { if (fp.os) dev.os = fp.os; if (fp.osIcon) dev.osIcon = fp.osIcon; }
+      dev.lastSeen = Date.now();
+      broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(dev));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/device/portscan' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const open = await devicePortScan(ip, 1024, 100);
+    dev.openPorts = [...new Set([...(dev.openPorts || []), ...open])].sort((a, b) => a - b);
+    broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ip, open, scanned: 1024 }));
+    return;
+  }
+
+  if (url.pathname === '/api/device/dns' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const out = { ip, hostname: dev.hostname && dev.hostname !== ip ? dev.hostname : null, reverse: [], forward: [] };
+    try { out.reverse = await dns.reverse(ip); } catch (e) { out.reverseError = e.code || 'lookup failed'; }
+    if (out.hostname) { out.forward = await dns.resolve4(out.hostname).catch(() => []); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(out));
     return;
   }
 
