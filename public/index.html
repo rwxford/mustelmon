@@ -379,6 +379,81 @@ td {
 .ts-btn-connect:hover { background: var(--blue); }
 .ts-btn-disconnect { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
 .ts-btn-disconnect:hover { background: rgba(248,81,73,0.25); }
+.ts-btn:disabled { background: var(--bg3); color: var(--text-dim); cursor: default; }
+
+/* travel connectivity panel */
+#travel-panel { margin-top: 16px; }
+.travel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  padding: 4px 0;
+}
+.travel-box {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.travel-box h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+.travel-verdict { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; margin-bottom: 6px; }
+.travel-verdict .dot { width: 7px; height: 7px; border-radius: 50%; }
+.travel-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 2px 0; }
+.travel-row .k { color: var(--text-dim); }
+.travel-row .v { font-family: var(--mono); color: var(--text-bright); text-align: right; word-break: break-all; }
+.travel-ports { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 4px; }
+.travel-port { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+.travel-port.open { background: rgba(63,185,80,0.12); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.travel-port.closed { background: rgba(248,81,73,0.12); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+
+/* clickable device rows + detail drawer */
+.device-row { cursor: pointer; }
+.device-row:hover { background: var(--bg3); }
+
+.drawer-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 50;
+}
+.drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; height: 100%; width: 440px; max-width: 92vw;
+  background: var(--bg2); border-left: 1px solid var(--border2);
+  transform: translateX(100%); transition: transform 0.2s ease;
+  z-index: 51; display: flex; flex-direction: column; box-shadow: -8px 0 24px rgba(0,0,0,0.45);
+}
+.drawer.open { transform: translateX(0); }
+.drawer-header {
+  display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+  border-bottom: 1px solid var(--border2);
+}
+.drawer-title { font-size: 15px; font-weight: 600; color: var(--text-bright); word-break: break-all; }
+.drawer-close {
+  margin-left: auto; background: var(--bg3); color: var(--text-dim);
+  border: 1px solid var(--border2); border-radius: 6px; width: 28px; height: 28px;
+  cursor: pointer; font-size: 13px; line-height: 1; flex-shrink: 0;
+}
+.drawer-close:hover { color: var(--text-bright); }
+.drawer-body { padding: 16px; overflow-y: auto; flex: 1; }
+.dd-section { margin-bottom: 18px; }
+.dd-section h4 {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-dim); margin: 0 0 8px;
+}
+.dd-row { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 3px 0; }
+.dd-row .k { color: var(--text-dim); flex-shrink: 0; }
+.dd-row .v { font-family: var(--mono); color: var(--text-bright); text-align: right; word-break: break-all; }
+.dd-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.dd-out { margin-top: 10px; font-size: 12px; color: var(--text); }
+.dd-ports { display: flex; flex-wrap: wrap; gap: 6px; }
+.dd-port { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: rgba(63,185,80,0.12); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
 
 .ts-status {
   display: flex;
@@ -759,6 +834,7 @@ td {
     </div>
   </div>
   <button id="scan-btn" onclick="triggerScan()">&#128269; Scan Network</button>
+  <button id="logout-btn" onclick="logout()" style="display:none;background:var(--bg3);color:var(--text-dim);border:1px solid var(--border2);border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;margin-left:8px" title="Sign out">Sign out</button>
 </header>
 
 <div class="container">
@@ -935,7 +1011,39 @@ td {
     </div>
   </div>
 
+  <!-- TRAVEL PANEL -->
+  <div id="travel-panel" class="card">
+    <div class="card-header">
+      <span style="font-size:15px">&#9992;&#65039;</span>
+      <span class="card-title">Travel Connectivity</span>
+      <span id="travel-checked-at" style="margin-left:auto;font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0 10px">
+        <button id="travel-check-btn" class="ts-btn ts-btn-connect" onclick="runTravelCheck()">Run Checks</button>
+        <button id="travel-speed-btn" class="ts-btn ts-btn-connect" onclick="runSpeedtest()">Speed Test</button>
+        <span style="font-size:11px;color:var(--text-dim)">
+          Captive portal, DNS tampering, latency, and blocked-port checks for untrusted Wi-Fi.
+          The speed test transfers ~20&nbsp;MB down / ~5&nbsp;MB up &mdash; avoid it on metered connections.
+        </span>
+      </div>
+      <div id="travel-error" style="display:none;color:var(--red);font-size:12px;padding:4px 0"></div>
+      <div id="travel-results" class="travel-grid" style="display:none"></div>
+      <div id="travel-speed" class="travel-grid" style="display:none"></div>
+    </div>
+  </div>
+
 </div><!-- /container -->
+
+<div id="drawer-backdrop" class="drawer-backdrop" onclick="closeDeviceDrawer()"></div>
+<aside id="device-drawer" class="drawer" role="dialog" aria-label="Device details">
+  <div class="drawer-header">
+    <span id="dd-icon" style="font-size:18px"></span>
+    <span class="drawer-title" id="dd-title">Device</span>
+    <button class="drawer-close" onclick="closeDeviceDrawer()" title="Close (Esc)">&#10005;</button>
+  </div>
+  <div class="drawer-body" id="dd-body"></div>
+</aside>
 
 <script>
 // ── UTILITIES ──────────────────────────────────────────────────────────────────
@@ -1033,14 +1141,16 @@ function renderDevices() {
     const svcsCell = svcs || '<span style="color:var(--text-dim);font-size:11px">—</span>';
 
     return `
-      <tr class="${d.isSelf ? 'self-row' : ''}">
+      <tr class="${d.isSelf ? 'self-row' : ''} device-row" onclick="openDeviceDrawer('${d.ip}')">
         <td>
           <div class="device-name">
             <div class="device-icon ${cls}">${icon}</div>
             <div>
               <div class="device-hostname">${shortHost}${d.isSelf ? ' <span class="device-self-badge">YOU</span>' : ''}</div>
+              ${(d.friendlyName || d.model || d.categoryLabel) ? `<div style="font-size:10px;color:var(--cyan)">${[d.friendlyName, d.model, d.categoryLabel].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i).join(' · ')}</div>` : ''}
               ${d.hostname && d.hostname !== d.ip && d.hostname !== shortHost
                 ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.hostname.replace(/\.svc\.cluster\.local$/,'')}</div>` : ''}
+              ${d.mac ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">${d.mac}${d.vendor && d.vendor !== 'Unknown' ? ' · ' + d.vendor : ''}</div>` : ''}
             </div>
           </div>
         </td>
@@ -1092,6 +1202,15 @@ function renderNetworkInfo() {
     },
   ];
 
+  // Wi-Fi link details are populated on macOS
+  if (networkInfo.wifi && networkInfo.wifi.ssid) {
+    const w = networkInfo.wifi;
+    rows.push({ label: 'Wi-Fi SSID', val: w.ssid });
+    if (w.channel) rows.push({ label: 'Wi-Fi Channel', val: w.channel });
+    if (w.signalNoise) rows.push({ label: 'Signal / Noise', val: w.signalNoise });
+    if (w.rate) rows.push({ label: 'Link Rate', val: w.rate });
+  }
+
   body.innerHTML = rows.map(r => `
     <div class="info-row">
       <span class="info-label">${r.label}</span>
@@ -1104,7 +1223,8 @@ function renderNetworkInfo() {
 
 function renderBandwidth(rates) {
   const body = document.getElementById('bandwidth-body');
-  const ifaces = Object.entries(rates).filter(([k]) => k !== 'lo');
+  // Drop loopback on every platform: `lo` on Linux, `lo0` on macOS.
+  const ifaces = Object.entries(rates).filter(([k]) => !/^lo\d*$/.test(k));
 
   if (!ifaces.length) {
     body.innerHTML = '<div style="color:var(--text-dim);font-size:12px">No data yet...</div>';
@@ -1121,7 +1241,7 @@ function renderBandwidth(rates) {
   body.innerHTML = ifaces.map(([name, r]) => `
     <div class="bw-interface">
       <div class="bw-name">
-        <span style="color:var(--cyan)">eth</span> ${name}
+        <span style="color:var(--cyan)">${name}</span>
         <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">
           Total: ${fmtBytes(r.rxTotal)} in / ${fmtBytes(r.txTotal)} out
         </span>
@@ -1527,6 +1647,11 @@ async function fetchAll() {
       fetch('/api/environment'),
       fetch('/api/tailscale'),
     ]);
+    // Session expired or not signed in; the server gates all API routes.
+    if (netRes.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
     networkInfo = await netRes.json();
     devices = await devRes.json();
     connectivity = await connRes.json();
@@ -1536,6 +1661,7 @@ async function fetchAll() {
     if (networkInfo.bandwidth) renderBandwidth(networkInfo.bandwidth);
     renderNetworkInfo();
     renderDevices();
+    refreshDeviceDrawer();
     renderConnectivity(connectivity);
     renderEnvironment(envData);
     renderTailscale(tsData);
@@ -1559,6 +1685,7 @@ function connectSSE() {
     if (msg.type === 'devicesUpdate') {
       devices = msg.devices;
       renderDevices();
+      refreshDeviceDrawer();
     }
     if (msg.type === 'tailscale') {
       renderTailscale(msg.state);
@@ -1573,6 +1700,7 @@ function connectSSE() {
       fetch('/api/devices').then(r => r.json()).then(d => {
         devices = d;
         renderDevices();
+        refreshDeviceDrawer();
       });
     }
   };
@@ -1604,8 +1732,273 @@ setInterval(() => {
 }, 15000);
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
+initAuth();
 fetchAll();
 connectSSE();
+
+// ── AUTH ─────────────────────────────────────────────────────────────────────
+async function initAuth() {
+  try {
+    const res = await fetch('/api/auth');
+    const auth = await res.json();
+    if (auth.enabled) document.getElementById('logout-btn').style.display = 'inline-block';
+  } catch {}
+}
+
+async function logout() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch {}
+  window.location.href = '/login';
+}
+
+// travel connectivity checks
+function travelVerdict(ok, okText, badText, warn) {
+  const cls = ok ? 'dot-green' : (warn ? 'dot-yellow' : 'dot-red');
+  const color = ok ? 'var(--green)' : (warn ? 'var(--yellow)' : 'var(--red)');
+  return `<div class="travel-verdict" style="color:${color}"><span class="dot ${cls}"></span>${ok ? okText : badText}</div>`;
+}
+
+function travelRow(k, v) {
+  return `<div class="travel-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+function renderTravelResults(r) {
+  const out = [];
+
+  let portal = `<div class="travel-box"><h4>Captive Portal</h4>`;
+  if (r.portal.verdict === 'online') portal += travelVerdict(true, 'Online &mdash; no portal');
+  else if (r.portal.verdict === 'portal') portal += travelVerdict(false, '', 'Captive portal detected', true);
+  else portal += travelVerdict(false, '', 'No internet access');
+  if (r.portal.portalUrl) portal += travelRow('Portal', `<a href="${r.portal.portalUrl}" target="_blank" rel="noopener">open page</a>`);
+  r.portal.probes.forEach(p => { portal += travelRow(p.name + ' probe', p.status); });
+  out.push(portal + '</div>');
+
+  const dnsOk = !r.dns.nxdomainHijack && r.dns.knownAnswer === 'ok';
+  let dnsBox = `<div class="travel-box"><h4>DNS Integrity</h4>`;
+  dnsBox += travelVerdict(dnsOk, 'No tampering detected', r.dns.nxdomainHijack ? 'Answers are rewritten' : 'Lookups unreliable', !r.dns.nxdomainHijack);
+  dnsBox += travelRow('NXDOMAIN test', r.dns.nxdomainHijack ? 'hijacked' : 'clean');
+  dnsBox += travelRow('Known answer', r.dns.knownAnswer);
+  dnsBox += travelRow('DoH 1.1.1.1', r.dns.dohReachable ? 'reachable' : 'blocked');
+  r.dns.issues.forEach(i => { dnsBox += `<div style="color:var(--yellow);font-size:11px;padding-top:4px">${i}</div>`; });
+  out.push(dnsBox + '</div>');
+
+  const lat = r.latency;
+  const latOk = lat.lossPct === 0 && lat.avgMs !== null && lat.avgMs < 150;
+  let latBox = `<div class="travel-box"><h4>Latency &mdash; ${lat.host}:${lat.port}</h4>`;
+  latBox += travelVerdict(latOk, 'Healthy', lat.lossPct === 100 ? 'Unreachable' : 'Degraded', lat.lossPct < 100);
+  latBox += travelRow('Loss', lat.lossPct + '%');
+  latBox += travelRow('Avg / jitter', lat.avgMs === null ? '&mdash;' : `${lat.avgMs} ms / ${lat.jitterMs} ms`);
+  latBox += travelRow('Min / max', lat.minMs === null ? '&mdash;' : `${lat.minMs} ms / ${lat.maxMs} ms`);
+  out.push(latBox + '</div>');
+
+  const blocked = r.egress.filter(p => !p.open).length;
+  let eg = `<div class="travel-box"><h4>Outbound Ports</h4>`;
+  eg += travelVerdict(blocked === 0, 'All test ports open', `${blocked} of ${r.egress.length} blocked`, blocked < r.egress.length);
+  eg += '<div class="travel-ports">' + r.egress.map(p =>
+    `<span class="travel-port ${p.open ? 'open' : 'closed'}" title="${p.label}: ${p.open ? 'open' : 'blocked'}">${p.port}</span>`).join('') + '</div>';
+  out.push(eg + '</div>');
+
+  const el = document.getElementById('travel-results');
+  el.innerHTML = out.join('');
+  el.style.display = 'grid';
+  document.getElementById('travel-checked-at').textContent = 'Checked ' + new Date(r.checkedAt).toLocaleTimeString();
+}
+
+async function travelPost(path, btn, busyLabel, idleLabel) {
+  const err = document.getElementById('travel-error');
+  btn.disabled = true; btn.textContent = busyLabel;
+  err.style.display = 'none';
+  try {
+    const res = await fetch(path, { method: 'POST' });
+    if (res.status === 401) { window.location.href = '/login'; return null; }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = 'block';
+    return null;
+  } finally {
+    btn.disabled = false; btn.textContent = idleLabel;
+  }
+}
+
+async function runTravelCheck() {
+  const data = await travelPost('/api/travel/check', document.getElementById('travel-check-btn'), 'Checking...', 'Run Checks');
+  if (data) renderTravelResults(data);
+}
+
+async function runSpeedtest() {
+  const data = await travelPost('/api/travel/speedtest', document.getElementById('travel-speed-btn'), 'Testing...', 'Speed Test');
+  if (!data) return;
+  const el = document.getElementById('travel-speed');
+  el.innerHTML = '<div class="travel-box"><h4>Speed &mdash; speed.cloudflare.com</h4>'
+    + travelRow('Download', data.download.mbps + ' Mbps')
+    + travelRow('Upload', data.upload.mbps + ' Mbps')
+    + travelRow('TTFB', data.download.ttfbMs + ' ms')
+    + '</div>';
+  el.style.display = 'grid';
+}
+
+// ── DEVICE DRAWER ─────────────────────────────────────────────────────────────
+let selectedDeviceIp = null;
+const PORT_NAMES = {21:'ftp',22:'ssh',23:'telnet',25:'smtp',53:'dns',80:'http',110:'pop3',
+  143:'imap',389:'ldap',443:'https',445:'smb',587:'smtp',631:'ipp',993:'imaps',995:'pop3s',
+  1883:'mqtt',3000:'http',3306:'mysql',3389:'rdp',5000:'http',5432:'pg',5900:'vnc',6379:'redis',
+  8006:'pve',8080:'http',8123:'hass',8443:'https',9000:'http',27017:'mongo'};
+
+function ddRow(k, v) { return `<div class="dd-row"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+function findDevice(ip) { return devices.find(d => d.ip === ip) || null; }
+function copyText(t) { if (navigator.clipboard) navigator.clipboard.writeText(t).catch(() => {}); }
+
+function openDeviceDrawer(ip) {
+  selectedDeviceIp = ip;
+  document.getElementById('dd-body').innerHTML = `
+    <div id="dd-info"></div>
+    <div class="dd-section">
+      <h4>Actions</h4>
+      <div class="dd-actions">
+        <button class="ts-btn ts-btn-connect" id="dd-ping-btn" onclick="deviceAction('ping')">Ping</button>
+        <button class="ts-btn ts-btn-connect" id="dd-portscan-btn" onclick="deviceAction('portscan')">Port scan 1-1024</button>
+        <button class="ts-btn ts-btn-connect" id="dd-rescan-btn" onclick="deviceAction('rescan')">Re-fingerprint</button>
+        <button class="ts-btn ts-btn-connect" id="dd-dns-btn" onclick="deviceAction('dns')">DNS lookup</button>
+      </div>
+      <div id="dd-action-out" class="dd-out"></div>
+    </div>`;
+  renderDeviceInfo();
+  document.getElementById('device-drawer').classList.add('open');
+  document.getElementById('drawer-backdrop').classList.add('open');
+}
+
+function closeDeviceDrawer() {
+  selectedDeviceIp = null;
+  document.getElementById('device-drawer').classList.remove('open');
+  document.getElementById('drawer-backdrop').classList.remove('open');
+}
+
+// Re-render only the live info block so action outputs are preserved.
+function refreshDeviceDrawer() {
+  if (selectedDeviceIp && document.getElementById('dd-info')) renderDeviceInfo();
+}
+
+function renderDeviceInfo() {
+  const info = document.getElementById('dd-info');
+  if (!info) return;
+  const d = findDevice(selectedDeviceIp);
+  if (!d) { info.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Device is no longer present on the network.</div>'; return; }
+
+  const name = (d.hostname && d.hostname !== d.ip) ? d.hostname.split('.')[0]
+    : (d.isSelf ? 'This Device' : (d.ip === gatewayIP ? 'Gateway/Router' : d.ip));
+  document.getElementById('dd-icon').textContent = d.osIcon || (deviceIcon(d).icon || '');
+  document.getElementById('dd-title').textContent = name + (d.isSelf ? ' (you)' : '');
+
+  let h = '<div class="dd-section"><h4>Identity</h4>';
+  h += ddRow('IP', d.ip);
+  if (d.mac) h += ddRow('MAC', d.mac);
+  if (d.vendor && d.vendor !== 'Unknown') h += ddRow('Vendor', d.vendor);
+  if (d.friendlyName) h += ddRow('Name', d.friendlyName);
+  if (d.model) h += ddRow('Model', d.model);
+  if (d.categoryLabel || d.deviceCategory) h += ddRow('Type', d.categoryLabel || d.deviceCategory);
+  if (d.hostname && d.hostname !== d.ip) h += ddRow('Hostname', d.hostname);
+  h += ddRow('OS', (d.osIcon ? d.osIcon + ' ' : '') + (d.os || 'Unknown'));
+  h += ddRow('Status', d.reachable ? 'Online' : 'Offline');
+  if (d.dev) h += ddRow('Seen on', d.dev);
+  if (d.fpConfidence) h += ddRow('Confidence', d.fpConfidence + '%');
+  h += '</div>';
+
+  h += '<div class="dd-section"><h4>Timeline</h4>';
+  if (d.firstSeen) h += ddRow('First seen', new Date(d.firstSeen).toLocaleString());
+  if (d.lastSeen) h += ddRow('Last seen', timeAgo(d.lastSeen));
+  h += '</div>';
+
+  h += '<div class="dd-section"><h4>Open ports</h4>';
+  if (d.openPorts && d.openPorts.length) {
+    h += '<div class="dd-ports">' + d.openPorts.map(p =>
+      `<span class="dd-port">${p}${PORT_NAMES[p] ? ' ' + PORT_NAMES[p] : ''}</span>`).join('') + '</div>';
+  } else {
+    h += '<div style="color:var(--text-dim);font-size:12px">None known yet. Run a port scan.</div>';
+  }
+  h += '</div>';
+
+  if (d.services && d.services.length) {
+    h += '<div class="dd-section"><h4>Services</h4>';
+    h += d.services.map(s => ddRow(s.name + (s.port ? ' :' + s.port : ''), s.version || s.banner || '')).join('');
+    h += '</div>';
+  }
+
+  if (d.mdns && d.mdns.services && d.mdns.services.length) {
+    h += '<div class="dd-section"><h4>mDNS services</h4>';
+    h += '<div class="dd-ports">' + d.mdns.services.map(s =>
+      `<span class="dd-port" style="background:rgba(57,197,207,0.12);color:var(--cyan);border-color:rgba(57,197,207,0.3)">${s}</span>`).join('') + '</div>';
+    h += '</div>';
+  }
+
+  const links = [];
+  if (d.openPorts && d.openPorts.includes(80)) links.push(`<a href="http://${d.ip}/" target="_blank" rel="noopener">http</a>`);
+  if (d.openPorts && (d.openPorts.includes(443) || d.openPorts.includes(8443))) links.push(`<a href="https://${d.ip}/" target="_blank" rel="noopener">https</a>`);
+  h += '<div class="dd-section"><h4>Quick</h4><div class="dd-actions">';
+  h += `<button class="ts-btn ts-btn-connect" onclick="copyText('${d.ip}')">Copy IP</button>`;
+  if (d.mac) h += `<button class="ts-btn ts-btn-connect" onclick="copyText('${d.mac}')">Copy MAC</button>`;
+  if (links.length) h += '<span style="display:inline-flex;gap:10px;align-items:center;margin-left:4px">' + links.join('') + '</span>';
+  h += '</div></div>';
+
+  info.innerHTML = h;
+}
+
+async function deviceAction(action) {
+  const ip = selectedDeviceIp;
+  if (!ip) return;
+  const labels = { ping: 'Ping', portscan: 'Port scan 1-1024', rescan: 'Re-fingerprint', dns: 'DNS lookup' };
+  const busy = { ping: 'Pinging...', portscan: 'Scanning...', rescan: 'Scanning...', dns: 'Resolving...' };
+  const btn = document.getElementById('dd-' + action + '-btn');
+  const out = document.getElementById('dd-action-out');
+  btn.disabled = true; btn.textContent = busy[action];
+  out.innerHTML = '';
+  try {
+    const res = await fetch('/api/device/' + action, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ip }),
+    });
+    if (res.status === 401) { window.location.href = '/login'; return; }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    out.innerHTML = renderActionResult(action, data);
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--red)">${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = labels[action];
+  }
+}
+
+function renderActionResult(action, data) {
+  if (action === 'ping') {
+    if (data.lossPct === 100) {
+      return `<div style="color:var(--yellow)">No TCP response on port ${data.port}. The host may block it or be offline.</div>`;
+    }
+    return '<div class="dd-section" style="margin:0"><h4>Latency &mdash; port ' + data.port + '</h4>'
+      + ddRow('Loss', data.lossPct + '%')
+      + ddRow('Avg / jitter', `${data.avgMs} ms / ${data.jitterMs} ms`)
+      + ddRow('Min / max', `${data.minMs} ms / ${data.maxMs} ms`)
+      + '</div>';
+  }
+  if (action === 'portscan') {
+    if (!data.open.length) return `<div style="color:var(--text-dim)">No open ports found in 1-${data.scanned}.</div>`;
+    return `<div style="margin-bottom:6px">Open in 1-${data.scanned}:</div><div class="dd-ports">`
+      + data.open.map(p => `<span class="dd-port">${p}${PORT_NAMES[p] ? ' ' + PORT_NAMES[p] : ''}</span>`).join('') + '</div>';
+  }
+  if (action === 'rescan') {
+    const n = (data.services || []).length;
+    return `<div style="color:var(--green)">Re-fingerprinted: ${n} service${n === 1 ? '' : 's'}`
+      + `${data.fpConfidence ? ', ' + data.fpConfidence + '% confidence' : ''}.</div>`;
+  }
+  if (action === 'dns') {
+    let h = '<div class="dd-section" style="margin:0"><h4>DNS</h4>';
+    h += ddRow('Reverse (PTR)', (data.reverse && data.reverse.length) ? data.reverse.join(', ') : (data.reverseError || 'none'));
+    if (data.hostname) h += ddRow('Forward (A)', (data.forward && data.forward.length) ? data.forward.join(', ') : 'none');
+    return h + '</div>';
+  }
+  return '';
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDeviceDrawer(); });
 </script>
-</body>
+</body
 </html>

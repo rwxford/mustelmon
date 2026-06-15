@@ -6,41 +6,173 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const os = require('os');
+const crypto = require('crypto');
 const dns = require('dns').promises;
 const { execFile, exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 
-// ── MAC OUI VENDOR MAP (common prefixes) ─────────────────────────────────────
-const OUI = {
-  '00:50:56': 'VMware', '00:0c:29': 'VMware', '00:1c:14': 'VMware',
-  '52:54:00': 'QEMU/KVM', 'fa:16:3e': 'OpenStack',
-  '02:42': 'Docker', '00:16:3e': 'Xen',
-  'aa:bb:cc': 'Virtual',
-  '00:1a:11': 'Google', 'f4:f5:d8': 'Google',
-  'b8:27:eb': 'Raspberry Pi', 'dc:a6:32': 'Raspberry Pi', 'e4:5f:01': 'Raspberry Pi',
-  '00:17:88': 'Philips Hue', '00:1e:06': 'Wibrain',
-  'b8:31:b5': 'Apple', '3c:07:54': 'Apple', 'a4:c3:f0': 'Apple',
-  '38:f9:d3': 'Apple', 'f0:18:98': 'Apple', '00:1b:63': 'Apple',
-  '00:25:00': 'Apple', '00:26:08': 'Apple',
-  'ac:bc:32': 'Apple', '04:0c:ce': 'Apple',
-  '00:1d:0f': 'ASIX Electronics',
-  '5a:83:65': 'Virtual Router',
-  'c6:92:08': 'Container/VM',
-  '00:00:00': 'Unknown',
-};
+// ── PLATFORM LAYER ────────────────────────────────────────────────────────────
+// Linux reads /proc directly. macOS shells out to the BSD networking tools
+// (arp, netstat, route, sysctl) and parses their output. The parsers are pure
+// functions so they can be exercised against captured fixtures in test.js.
+const IS_DARWIN = process.platform === 'darwin';
+
+// macOS prints MAC octets without zero padding (e.g. 0:1c:b3:9:fa:d1).
+function normalizeMac(mac) {
+  if (!mac) return mac;
+  return mac.split(':').map(o => o.padStart(2, '0')).join(':').toLowerCase();
+}
+
+function netmaskToCidr(netmask) {
+  return netmask.split('.')
+    .map(Number)
+    .reduce((bits, octet) => bits + ((octet >>> 0).toString(2).match(/1/g) || []).length, 0);
+}
+
+// Parses `arp -an` output (macOS/BSD), e.g.
+//   ? (192.168.1.1) at 88:96:4e:3a:dd:1 on en0 ifscope [ethernet]
+//   ? (192.168.1.50) at (incomplete) on en0 ifscope [ethernet]
+// Incomplete, broadcast, and multicast entries are dropped.
+function parseArpOutput(stdout) {
+  const devices = {};
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-f:]+|\(incomplete\)) on (\S+)/i);
+    if (!m) continue;
+    const [, ip, rawMac, dev] = m;
+    if (rawMac === '(incomplete)') continue;
+    const mac = normalizeMac(rawMac);
+    if (mac === 'ff:ff:ff:ff:ff:ff' || mac === '00:00:00:00:00:00') continue;
+    const firstOctet = parseInt(ip.split('.')[0], 10);
+    if (firstOctet >= 224) continue; // multicast/reserved
+    devices[ip] = { ip, mac, dev, flags: 2, vendor: lookupVendor(mac) };
+  }
+  return devices;
+}
+
+// Parses `netstat -ib` output (macOS). Only <Link#N> rows carry interface
+// byte counters. Rows for interfaces without a MAC (e.g. lo0, utun) have one
+// fewer column than the header because the Address field is empty.
+function parseNetstatIb(stdout) {
+  const lines = stdout.trim().split('\n');
+  if (lines.length < 2) return {};
+  const header = lines[0].trim().split(/\s+/);
+  const netIdx = header.indexOf('Network');
+  const addrIdx = header.indexOf('Address');
+  const ibIdx = header.indexOf('Ibytes');
+  const obIdx = header.indexOf('Obytes');
+  if (netIdx === -1 || ibIdx === -1 || obIdx === -1) return {};
+  const counters = {};
+  for (const line of lines.slice(1)) {
+    const cols = line.trim().split(/\s+/);
+    if (!cols[netIdx] || !cols[netIdx].startsWith('<Link')) continue;
+    // Missing Address column shifts everything after it left by one.
+    const shift = cols.length === header.length ? 0 : cols.length === header.length - 1 ? 1 : null;
+    if (shift === null) continue;
+    const name = cols[0];
+    const rx = parseInt(cols[ibIdx - shift], 10);
+    const tx = parseInt(cols[obIdx - shift], 10);
+    if (Number.isNaN(rx) || Number.isNaN(tx)) continue;
+    const mac = shift === 0 && addrIdx !== -1 ? normalizeMac(cols[addrIdx]) : null;
+    counters[name] = { rx, tx, mac };
+  }
+  return counters;
+}
+
+// ── AUTHENTICATION ─────────────────────────────────────────────────────────────
+// Single shared password via MUSTELMON_PASSWORD. When unset, auth is
+// disabled and the dashboard is open (the pre-auth behaviour). Sessions are
+// HMAC-signed cookies; the secret is generated at boot, so restarting the
+// server invalidates all sessions. Cookies (not bearer tokens) are used
+// because EventSource cannot send custom headers to the /events stream.
+const AUTH_PASSWORD = process.env.MUSTELMON_PASSWORD || '';
+const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
+const SESSION_SECRET = crypto.randomBytes(32);
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const COOKIE_NAME = 'mustelmon_session';
+
+// Per-IP throttling: 5 consecutive failures lock the IP out for 60 seconds.
+const loginFailures = new Map();
+
+function sha256(s) {
+  return crypto.createHash('sha256').update(s).digest();
+}
+
+// Hashing both sides first makes timingSafeEqual usable with inputs of
+// different lengths without leaking the password length.
+function passwordMatches(candidate) {
+  return crypto.timingSafeEqual(sha256(candidate), sha256(AUTH_PASSWORD));
+}
+
+function makeSessionToken() {
+  const exp = Date.now() + SESSION_TTL_MS;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(String(exp)).digest('hex');
+  return `${exp}.${sig}`;
+}
+
+function verifySessionToken(token) {
+  if (!token) return false;
+  const [expStr, sig] = token.split('.');
+  const exp = parseInt(expStr, 10);
+  if (!exp || !sig || Date.now() > exp) return false;
+  const expect = crypto.createHmac('sha256', SESSION_SECRET).update(String(exp)).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expect, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+function isAuthenticated(req) {
+  if (!AUTH_ENABLED) return true;
+  return verifySessionToken(parseCookies(req)[COOKIE_NAME]);
+}
+
+function loginLocked(ip) {
+  const f = loginFailures.get(ip);
+  return !!(f && f.lockedUntil && Date.now() < f.lockedUntil);
+}
+
+function recordLoginFailure(ip) {
+  const f = loginFailures.get(ip) || { count: 0, lockedUntil: 0 };
+  f.count++;
+  if (f.count >= 5) {
+    f.lockedUntil = Date.now() + 60000;
+    f.count = 0;
+  }
+  loginFailures.set(ip, f);
+}
+
+// ── MAC OUI VENDOR LOOKUP ─────────────────────────────────────
+const { oui: OUI, prefixes: OUI_PREFIXES } = require('./oui');
+const mdns = require('./mdns.js');
 
 function lookupVendor(mac) {
   if (!mac || mac === '00:00:00:00:00:00') return 'Unknown';
-  const parts = mac.toLowerCase().split(':');
-  const oui6 = parts.slice(0, 3).join(':');
-  const oui4 = parts.slice(0, 2).join(':');
-  for (const [prefix, vendor] of Object.entries(OUI)) {
-    if (oui6.startsWith(prefix.toLowerCase())) return vendor;
-    if (oui4 === prefix.toLowerCase()) return vendor;
+  const oui6 = mac.toLowerCase().split(':').slice(0, 3).join(':');
+  if (OUI[oui6]) return OUI[oui6];
+  for (const [prefix, vendor] of Object.entries(OUI_PREFIXES)) {
+    if (oui6.startsWith(prefix)) return vendor;
   }
+  // The locally-administered bit (0x02 in the first octet) marks randomized or
+  // private MACs, which have no registered vendor by design.
+  const firstOctet = parseInt(oui6.slice(0, 2), 16);
+  if (Number.isFinite(firstOctet) && (firstOctet & 0x02)) return 'Randomized MAC';
   return 'Unknown';
 }
 
@@ -319,8 +451,10 @@ async function runFingerprintAll() {
       try {
         const fp = await fingerprintDevice(d);
         d.fingerprint = fp;
+        // Self is labelled from local platform detection; banner/header
+        // fingerprints (often the monitor's own HTTP server) must not relabel it.
         if (fp.os && !d.os) d.os = fp.os;
-        if (fp.osIcon) d.osIcon = fp.osIcon;
+        if (fp.osIcon && !d.isSelf) d.osIcon = fp.osIcon;
         if (fp.services.length) d.services = fp.services;
         if (fp.confidence) d.fpConfidence = fp.confidence;
       } catch {}
@@ -408,6 +542,7 @@ async function refreshTailscale() {
 // ── ENVIRONMENT DETECTION ─────────────────────────────────────────────────────
 
 async function detectEnvironment() {
+  if (IS_DARWIN) return detectEnvironmentDarwin();
   const env = {
     runtime: 'unknown',       // kubernetes | docker | lxc | wsl | vm | bare-metal
     orchestrator: null,       // kubernetes | docker-compose | nomad | null
@@ -681,6 +816,102 @@ async function detectEnvironment() {
   return env;
 }
 
+// macOS host detection. Container/Kubernetes signals do not apply; this
+// reports the OS, hardware, interfaces, Wi-Fi link, and Tailscale presence.
+async function detectEnvironmentDarwin() {
+  const env = {
+    runtime: 'bare-metal',
+    orchestrator: null,
+    distribution: null,
+    workloadPlatform: null,
+    containerRuntime: null,
+    os: {},
+    hardware: {},
+    network: {},
+    kubernetes: null,
+    tailscale: null,
+    confidence: {},
+  };
+  const signals = ['darwin'];
+
+  try {
+    const { stdout } = await execAsync('sw_vers', { timeout: 5000 });
+    const name = stdout.match(/ProductName:\s*(.+)/)?.[1]?.trim();
+    const version = stdout.match(/ProductVersion:\s*(.+)/)?.[1]?.trim();
+    env.os = { name: [name, version].filter(Boolean).join(' ') || 'macOS', id: 'macos', version };
+  } catch {
+    env.os = { name: 'macOS', id: 'macos' };
+  }
+  try { env.os.kernel = (await execAsync('uname -r')).stdout.trim(); } catch {}
+
+  try {
+    const { stdout } = await execAsync('sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize', { timeout: 5000 });
+    const [cpu, cores, mem] = stdout.trim().split('\n');
+    env.hardware.cpu = cpu;
+    env.hardware.cores = parseInt(cores, 10) || null;
+    if (mem) env.hardware.memTotalMB = Math.round(parseInt(mem, 10) / 1024 / 1024);
+  } catch {}
+
+  // VM guest detection (UTM, Parallels, VMware): set to 1 inside guests.
+  try {
+    const { stdout } = await execAsync('sysctl -n kern.hv_vmm_present', { timeout: 3000 });
+    if (stdout.trim() === '1') {
+      env.runtime = 'vm';
+      signals.push('hv-vmm-present');
+    }
+  } catch {}
+  if (env.runtime === 'bare-metal') signals.push('no-container-signals');
+
+  try {
+    const { stdout } = await execAsync('ifconfig', { timeout: 5000 });
+    const ifaces = [];
+    for (const block of stdout.split(/\n(?=\S)/)) {
+      const nameMatch = block.match(/^(\S+?):/);
+      const mtuMatch = block.match(/mtu\s+(\d+)/);
+      if (!nameMatch) continue;
+      ifaces.push({
+        name: nameMatch[1],
+        mtu: mtuMatch ? parseInt(mtuMatch[1], 10) : null,
+        linkType: 'ether',
+        isVeth: false,
+        peerIdx: null,
+      });
+    }
+    env.network.interfaces = ifaces;
+    const primary = ifaces.find(i => i.name.startsWith('en'));
+    if (primary) {
+      env.network.primaryMTU = primary.mtu;
+      env.network.primaryLinkType = 'ether';
+    }
+  } catch {}
+
+  // The Tailscale CLI lives inside the app bundle unless symlinked into PATH.
+  for (const bin of ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']) {
+    try {
+      const { stdout } = await execAsync(`"${bin}" status --json`, { timeout: 3000 });
+      const ts = JSON.parse(stdout);
+      env.tailscale = {
+        detected: true,
+        self: ts.Self?.HostName,
+        ip: ts.Self?.TailscaleIPs?.[0],
+        domain: ts.MagicDNSSuffix || null,
+      };
+      signals.push('tailscale-cli');
+      break;
+    } catch {}
+  }
+
+  const wifi = await getWifiInfo();
+  if (wifi) {
+    env.network.wifi = wifi;
+    signals.push('wifi');
+  }
+
+  env.signals = signals;
+  env.detectedAt = new Date().toISOString();
+  return env;
+}
+
 let cachedEnvironment = null;
 
 async function getEnvironment() {
@@ -691,6 +922,7 @@ async function getEnvironment() {
 
 // ── NETWORK INFO ──────────────────────────────────────────────────────────────
 async function getNetworkInfo() {
+  if (IS_DARWIN) return getNetworkInfoDarwin();
   const info = { interfaces: [], gateway: null, dns: [], hostname: 'unknown', subnet: null };
 
   // Hostname
@@ -759,6 +991,96 @@ async function getNetworkInfo() {
   return info;
 }
 
+async function getNetworkInfoDarwin() {
+  const info = { interfaces: [], gateway: null, dns: [], hostname: 'unknown', subnet: null };
+
+  try { info.hostname = (await execAsync('hostname')).stdout.trim(); } catch {}
+
+  let counters = {};
+  try {
+    counters = parseNetstatIb((await execAsync('netstat -ib', { timeout: 5000 })).stdout);
+  } catch {}
+
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (name === 'lo0') continue;
+    const v4 = (addrs || []).find(a => a.family === 'IPv4' && !a.internal);
+    if (!v4) continue;
+    info.interfaces.push({
+      name,
+      ip: v4.address,
+      cidr: netmaskToCidr(v4.netmask),
+      mac: v4.mac && v4.mac !== '00:00:00:00:00:00' ? v4.mac : (counters[name]?.mac || null),
+      rx: counters[name]?.rx || 0,
+      tx: counters[name]?.tx || 0,
+    });
+  }
+
+  // Gateway and primary interface come from the default route.
+  let defaultIface = null;
+  try {
+    const { stdout } = await execAsync('route -n get default', { timeout: 5000 });
+    const gw = stdout.match(/gateway:\s*(\d+\.\d+\.\d+\.\d+)/);
+    if (gw) info.gateway = gw[1];
+    defaultIface = stdout.match(/interface:\s*(\S+)/)?.[1] || null;
+  } catch {}
+
+  // Put the default-route interface first so scans target the LAN rather
+  // than a VPN/utun interface. runScan() always uses the first interface.
+  if (defaultIface) {
+    info.interfaces.sort((a, b) => (a.name === defaultIface ? -1 : b.name === defaultIface ? 1 : 0));
+  }
+  const primary = info.interfaces[0];
+  if (primary && primary.ip && primary.cidr) {
+    info.subnet = cidrToSubnet(primary.ip, primary.cidr);
+  }
+
+  // /etc/resolv.conf is auto-generated on macOS and lists the active resolvers.
+  try {
+    const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const ns = resolv.match(/^nameserver\s+(.+)$/mg);
+    if (ns) info.dns = ns.map(l => l.replace('nameserver', '').trim());
+    const search = resolv.match(/^search\s+(.+)$/m);
+    if (search) info.dnsSearch = search[1].trim().split(/\s+/);
+  } catch {}
+
+  const wifi = await getWifiInfo();
+  if (wifi) info.wifi = wifi;
+
+  return info;
+}
+
+// system_profiler is the only SSID source that works unprivileged on recent
+// macOS, but it takes 1-4s, so results are cached for 60 seconds.
+let wifiCache = { data: null, ts: 0 };
+
+async function getWifiInfo() {
+  if (!IS_DARWIN) return null;
+  if (Date.now() - wifiCache.ts < 60000) return wifiCache.data;
+  let data = null;
+  try {
+    const { stdout } = await execAsync('system_profiler SPAirPortDataType -json', {
+      timeout: 15000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const root = JSON.parse(stdout).SPAirPortDataType?.[0];
+    const ifaces = root?.spairport_airport_interfaces || [];
+    const active = ifaces.find(i => i.spairport_current_network_information);
+    const cur = active?.spairport_current_network_information;
+    if (cur) {
+      data = {
+        interface: active._name || null,
+        ssid: cur._name || null,
+        channel: cur.spairport_network_channel || null,
+        signalNoise: cur.spairport_signal_noise || null,
+        rate: cur.spairport_network_rate ? `${cur.spairport_network_rate} Mbps` : null,
+        security: cur.spairport_security_mode || null,
+      };
+    }
+  } catch {}
+  wifiCache = { data, ts: Date.now() };
+  return data;
+}
+
 function cidrToSubnet(ip, cidr) {
   const parts = ip.split('.').map(Number);
   const mask = ~((1 << (32 - cidr)) - 1) >>> 0;
@@ -781,7 +1103,15 @@ function subnetIPs(ip, cidr) {
 }
 
 // ── ARP TABLE ─────────────────────────────────────────────────────────────────
-function readArpTable() {
+async function readArpTable() {
+  if (IS_DARWIN) {
+    try {
+      const { stdout } = await execAsync('arp -an', { timeout: 5000 });
+      return parseArpOutput(stdout);
+    } catch {
+      return {};
+    }
+  }
   const devices = {};
   try {
     const raw = fs.readFileSync('/proc/net/arp', 'utf8');
@@ -867,7 +1197,7 @@ async function runScan() {
   if (!myIP) return;
 
   // First, read ARP table to get already-known devices
-  const arpEntries = readArpTable();
+  const arpEntries = await readArpTable();
 
   // Scan subnet IPs to populate ARP
   const allIPs = subnetIPs(myIP, cidr);
@@ -895,7 +1225,7 @@ async function runScan() {
       }
     }));
     // Re-read ARP after each batch (TCP connects populate it)
-    const fresh = readArpTable();
+    const fresh = await readArpTable();
     Object.assign(arpEntries, fresh);
   }
 
@@ -922,15 +1252,19 @@ async function runScan() {
   delete devices['::1'];
 
   // Mark self
+  const selfOs = IS_DARWIN ? 'macOS' : null;
+  const selfOsIcon = IS_DARWIN ? '🍎' : null;
   if (devices[myIP]) {
     devices[myIP].isSelf = true;
     devices[myIP].hostname = networkInfo.hostname;
     devices[myIP].reachable = true;
+    if (selfOs) { devices[myIP].os = selfOs; devices[myIP].osIcon = selfOsIcon; }
   } else {
     devices[myIP] = {
       ip: myIP, mac: networkInfo.interfaces.find(i=>i.ip===myIP)?.mac,
       hostname: networkInfo.hostname, isSelf: true,
       reachable: true, lastSeen: Date.now(), firstSeen: Date.now(),
+      os: selfOs, osIcon: selfOsIcon,
       vendor: lookupVendor(networkInfo.interfaces.find(i=>i.ip===myIP)?.mac || ''),
     };
   }
@@ -938,32 +1272,69 @@ async function runScan() {
   broadcastSSE({ type: 'scanComplete', deviceCount: Object.keys(devices).length });
   // Kick off fingerprinting on newly discovered devices
   runFingerprintAll().catch(console.error);
+  // Best-effort mDNS enrichment; link-local only, so it may see nothing on a
+  // segmented network. Runs in the background and broadcasts when it lands.
+  enrichWithMdns(myIP).catch(() => {});
+}
+
+// Merges mDNS discovery results into known devices: advertised services, a
+// device category, and (when published) an exact model and friendly name.
+async function enrichWithMdns(interfaceAddress) {
+  let found;
+  try {
+    found = await mdns.discover({ timeoutMs: 2500, interfaceAddress });
+  } catch {
+    return;
+  }
+  let changed = false;
+  for (const [ip, info] of Object.entries(found)) {
+    const d = devices[ip];
+    if (!d) continue;
+    d.mdns = { services: info.services, model: info.model, name: info.name };
+    if (info.category) d.deviceCategory = info.category;
+    if (info.categoryLabel) d.categoryLabel = info.categoryLabel;
+    if (info.model && !d.model) d.model = info.model;
+    if (info.name && !d.friendlyName) d.friendlyName = info.name;
+    changed = true;
+  }
+  if (changed) broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
 }
 
 // ── BANDWIDTH MONITORING ──────────────────────────────────────────────────────
-function updateBandwidth() {
-  try {
-    const raw = fs.readFileSync('/proc/net/dev', 'utf8');
-    const lines = raw.trim().split('\n').slice(2);
-    const now = Date.now();
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/);
-      const name = parts[0].replace(':', '');
-      const rx = parseInt(parts[1]);
-      const tx = parseInt(parts[9]);
-      if (lastBandwidth[name]) {
-        const dt = (now - lastBandwidth[name].ts) / 1000;
-        if (dt > 0) {
-          bandwidthRates[name] = {
-            rxRate: Math.max(0, (rx - lastBandwidth[name].rx) / dt),
-            txRate: Math.max(0, (tx - lastBandwidth[name].tx) / dt),
-            rxTotal: rx, txTotal: tx,
-          };
-        }
+async function updateBandwidth() {
+  const now = Date.now();
+  const counters = {};
+  if (IS_DARWIN) {
+    try {
+      const { stdout } = await execAsync('netstat -ib', { timeout: 5000 });
+      for (const [name, c] of Object.entries(parseNetstatIb(stdout))) {
+        counters[name] = { rx: c.rx, tx: c.tx };
       }
-      lastBandwidth[name] = { rx, tx, ts: now };
+    } catch {}
+  } else {
+    try {
+      const raw = fs.readFileSync('/proc/net/dev', 'utf8');
+      const lines = raw.trim().split('\n').slice(2);
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        const name = parts[0].replace(':', '');
+        counters[name] = { rx: parseInt(parts[1]), tx: parseInt(parts[9]) };
+      }
+    } catch {}
+  }
+  for (const [name, { rx, tx }] of Object.entries(counters)) {
+    if (lastBandwidth[name]) {
+      const dt = (now - lastBandwidth[name].ts) / 1000;
+      if (dt > 0) {
+        bandwidthRates[name] = {
+          rxRate: Math.max(0, (rx - lastBandwidth[name].rx) / dt),
+          txRate: Math.max(0, (tx - lastBandwidth[name].tx) / dt),
+          rxTotal: rx, txTotal: tx,
+        };
+      }
     }
-  } catch {}
+    lastBandwidth[name] = { rx, tx, ts: now };
+  }
   broadcastSSE({ type: 'bandwidth', rates: bandwidthRates });
 }
 
@@ -987,6 +1358,233 @@ async function checkConnectivity() {
 }
 
 // ── SSE CLIENTS ───────────────────────────────────────────────────────────────
+// ── TRAVEL CHECKS ───────────────────────────────────────────────────────────
+// On-demand diagnostics for untrusted networks (hotel/cafe Wi-Fi):
+// captive portal detection, DNS tampering, latency/jitter/loss, and
+// outbound port blocking.
+
+// Both endpoints return fixed content on a clean network. A redirect or
+// altered body means something intercepts plain HTTP (a captive portal).
+async function checkCaptivePortal() {
+  const probes = [
+    {
+      name: 'Apple', host: 'captive.apple.com', path: '/hotspot-detect.html',
+      expect: r => r.statusCode === 200 && r.body.includes('Success'),
+    },
+    {
+      name: 'Google', host: 'www.gstatic.com', path: '/generate_204',
+      expect: r => r.statusCode === 204,
+    },
+  ];
+  const results = await Promise.all(probes.map(async p => {
+    const raw = await httpRequest(p.host, 80, p.path, 4000);
+    const parsed = parseHttpResponse(raw);
+    if (!parsed || !parsed.statusCode) return { name: p.name, status: 'offline' };
+    if (p.expect(parsed)) return { name: p.name, status: 'ok' };
+    return { name: p.name, status: 'portal', portalUrl: parsed.location || null, statusCode: parsed.statusCode };
+  }));
+  const portal = results.find(r => r.status === 'portal');
+  const okCount = results.filter(r => r.status === 'ok').length;
+  return {
+    verdict: portal ? 'portal' : okCount > 0 ? 'online' : 'offline',
+    portalUrl: portal?.portalUrl || null,
+    probes: results,
+  };
+}
+
+async function checkDnsIntegrity() {
+  const out = { nxdomainHijack: null, knownAnswer: null, dohReachable: null, issues: [] };
+
+  // A random subdomain must NXDOMAIN. Portals that rewrite DNS answer
+  // everything, which is the most common hijack signature.
+  const ghost = `mustelmon-${crypto.randomBytes(6).toString('hex')}.example.com`;
+  try {
+    await dns.resolve4(ghost);
+    out.nxdomainHijack = true;
+    out.issues.push('A nonexistent name resolved: this network rewrites DNS answers');
+  } catch {
+    out.nxdomainHijack = false;
+  }
+
+  // one.one.one.one has a stable, well-known answer set.
+  try {
+    const addrs = await dns.resolve4('one.one.one.one');
+    out.knownAnswer = addrs.some(a => a === '1.1.1.1' || a === '1.0.0.1') ? 'ok' : 'mismatch';
+    if (out.knownAnswer === 'mismatch') out.issues.push(`one.one.one.one resolved to ${addrs.join(', ')}`);
+  } catch {
+    out.knownAnswer = 'fail';
+    out.issues.push('Could not resolve one.one.one.one');
+  }
+
+  // DNS-over-HTTPS escape hatch: is 1.1.1.1 reachable directly?
+  try {
+    const { statusCode } = await httpsGet('https://1.1.1.1/dns-query?name=example.com&type=A', { accept: 'application/dns-json' });
+    out.dohReachable = statusCode === 200;
+  } catch {
+    out.dohReachable = false;
+  }
+  return out;
+}
+
+async function measureLatency(host = '1.1.1.1', port = 443, count = 10) {
+  const samples = [];
+  let lost = 0;
+  for (let i = 0; i < count; i++) {
+    const start = Date.now();
+    const ok = await tcpProbe(host, port, 2000);
+    if (ok) samples.push(Date.now() - start);
+    else lost++;
+    await new Promise(r => setTimeout(r, 120));
+  }
+  if (!samples.length) {
+    return { host, port, sent: count, lossPct: 100, minMs: null, avgMs: null, maxMs: null, jitterMs: null };
+  }
+  const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+  // Jitter as the mean absolute difference between consecutive samples.
+  let jitter = 0;
+  for (let i = 1; i < samples.length; i++) jitter += Math.abs(samples[i] - samples[i - 1]);
+  jitter = samples.length > 1 ? jitter / (samples.length - 1) : 0;
+  return {
+    host, port, sent: count,
+    lossPct: Math.round((lost / count) * 100),
+    minMs: Math.min(...samples),
+    avgMs: Math.round(avg * 10) / 10,
+    maxMs: Math.max(...samples),
+    jitterMs: Math.round(jitter * 10) / 10,
+  };
+}
+
+// portquiz.net accepts TCP on every port, so a failed connect means the
+// local network blocks that outbound port.
+const EGRESS_PORTS = [
+  { port: 22, label: 'SSH' },
+  { port: 25, label: 'SMTP' },
+  { port: 53, label: 'DNS/TCP' },
+  { port: 587, label: 'Mail submit' },
+  { port: 993, label: 'IMAPS' },
+  { port: 3389, label: 'RDP' },
+  { port: 8443, label: 'HTTPS-Alt' },
+];
+
+async function checkEgressPorts() {
+  return Promise.all(EGRESS_PORTS.map(async ({ port, label }) => ({
+    port, label, open: await tcpProbe('portquiz.net', port, 4000),
+  })));
+}
+
+async function runTravelChecks() {
+  const [portal, dnsIntegrity, latency, egress] = await Promise.all([
+    checkCaptivePortal(),
+    checkDnsIntegrity(),
+    measureLatency(),
+    checkEgressPorts(),
+  ]);
+  return { portal, dns: dnsIntegrity, latency, egress, checkedAt: new Date().toISOString() };
+}
+
+// ── SPEED TEST ───────────────────────────────────────────────────────────────
+// Cloudflare's speed endpoints need no API key. Download measures payload
+// bytes over wall time; upload posts random (incompressible) bytes.
+function speedtestDownload(bytes = 20000000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    let ttfb = null;
+    let received = 0;
+    const req = https.get(`https://speed.cloudflare.com/__down?bytes=${bytes}`, res => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      res.on('data', chunk => {
+        if (ttfb === null) ttfb = Date.now() - start;
+        received += chunk.length;
+      });
+      res.on('end', () => {
+        const seconds = (Date.now() - start) / 1000;
+        resolve({
+          bytes: received,
+          seconds: Math.round(seconds * 100) / 100,
+          mbps: Math.round((received * 8 / seconds / 1e6) * 10) / 10,
+          ttfbMs: ttfb,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function speedtestUpload(bytes = 5000000) {
+  return new Promise((resolve, reject) => {
+    const payload = crypto.randomBytes(bytes);
+    const start = Date.now();
+    const req = https.request({
+      hostname: 'speed.cloudflare.com',
+      path: '/__up',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': payload.length },
+    }, res => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      res.resume();
+      res.on('end', () => {
+        const seconds = (Date.now() - start) / 1000;
+        resolve({
+          bytes,
+          seconds: Math.round(seconds * 100) / 100,
+          mbps: Math.round((bytes * 8 / seconds / 1e6) * 10) / 10,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+let speedtestRunning = false;
+
+// ── DEVICE DETAIL ACTIONS ─────────────────────────────────────────────────────
+// On-demand probes for the device drawer. Every action is restricted to an IP
+// already discovered on the local network (present in the devices map). Without
+// that guard these authenticated endpoints would be an arbitrary port-scan/SSRF
+// proxy.
+function readJsonBody(req, limit = 1 << 20) {
+  return new Promise(resolve => {
+    let body = '';
+    req.on('data', d => { body += d; if (body.length > limit) req.destroy(); });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch { resolve(null); } });
+    req.on('error', () => resolve(null));
+  });
+}
+
+function knownDevice(ip) {
+  return ip && Object.prototype.hasOwnProperty.call(devices, ip) ? devices[ip] : null;
+}
+
+async function firstReachablePort(ip, ports) {
+  for (const p of ports) {
+    if (await tcpProbe(ip, p, 800)) return p;
+  }
+  return null;
+}
+
+async function devicePortScan(ip, maxPort = 1024, concurrency = 100) {
+  const open = [];
+  for (let start = 1; start <= maxPort; start += concurrency) {
+    const batch = [];
+    for (let p = start; p < start + concurrency && p <= maxPort; p++) batch.push(p);
+    const results = await Promise.all(batch.map(async p => (await tcpProbe(ip, p, 500)) ? p : -1));
+    for (const p of results) if (p !== -1) open.push(p);
+  }
+  return open;
+}
+
 const sseClients = new Set();
 
 function broadcastSSE(data) {
@@ -1008,6 +1606,84 @@ const server = http.createServer(async (req, res) => {
 
   // CORS for dev
   res.setHeader('Access-Control-Allow-Origin', '*');
+
+  // ── Auth routes (public) ──
+  if (url.pathname === '/api/auth') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ enabled: AUTH_ENABLED, authenticated: isAuthenticated(req) }));
+    return;
+  }
+
+  if (url.pathname === '/api/login' && req.method === 'POST') {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', () => {
+      if (!AUTH_ENABLED) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Authentication is disabled' }));
+        return;
+      }
+      const ip = req.socket.remoteAddress || 'unknown';
+      if (loginLocked(ip)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Too many attempts. Try again in a minute.' }));
+        return;
+      }
+      let password = '';
+      try { password = String(JSON.parse(body).password || ''); } catch {}
+      if (password && passwordMatches(password)) {
+        loginFailures.delete(ip);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Set-Cookie': `${COOKIE_NAME}=${makeSessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+        });
+        res.end(JSON.stringify({ ok: true }));
+      } else {
+        recordLoginFailure(ip);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Incorrect password' }));
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/logout' && req.method === 'POST') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Set-Cookie': `${COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+    });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (url.pathname === '/login') {
+    if (!AUTH_ENABLED || isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+    try {
+      const data = fs.readFileSync(path.join(__dirname, 'public', 'login.html'));
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(data);
+    } catch {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
+  // ── Auth gate: everything below requires a session when auth is enabled ──
+  if (!isAuthenticated(req)) {
+    if (url.pathname.startsWith('/api/') || url.pathname === '/events') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Authentication required' }));
+    } else {
+      res.writeHead(302, { Location: '/login' });
+      res.end();
+    }
+    return;
+  }
 
   // SSE stream
   if (url.pathname === '/events') {
@@ -1102,6 +1778,99 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/device/ping' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const candidates = (dev.openPorts && dev.openPorts.length) ? dev.openPorts : [80, 443, 22, 53, 8080, 445, 7];
+    const port = (await firstReachablePort(ip, candidates)) || candidates[0];
+    const result = await measureLatency(ip, port, 10);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  if (url.pathname === '/api/device/rescan' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    try {
+      const arp = await readArpTable();
+      if (arp[ip]) { dev.mac = arp[ip].mac || dev.mac; dev.vendor = arp[ip].vendor || dev.vendor; }
+      const fp = await fingerprintDevice(dev);
+      dev.fingerprint = fp;
+      if (fp.services.length) dev.services = fp.services;
+      if (fp.confidence) dev.fpConfidence = fp.confidence;
+      // An explicit rescan may relabel the OS, but never the local host.
+      if (!dev.isSelf) { if (fp.os) dev.os = fp.os; if (fp.osIcon) dev.osIcon = fp.osIcon; }
+      dev.lastSeen = Date.now();
+      broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(dev));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/device/portscan' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const open = await devicePortScan(ip, 1024, 100);
+    dev.openPorts = [...new Set([...(dev.openPorts || []), ...open])].sort((a, b) => a - b);
+    broadcastSSE({ type: 'devicesUpdate', devices: Object.values(devices) });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ip, open, scanned: 1024 }));
+    return;
+  }
+
+  if (url.pathname === '/api/device/dns' && req.method === 'POST') {
+    const { ip } = (await readJsonBody(req)) || {};
+    const dev = knownDevice(ip);
+    if (!dev) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown device' })); return; }
+    const out = { ip, hostname: dev.hostname && dev.hostname !== ip ? dev.hostname : null, reverse: [], forward: [] };
+    try { out.reverse = await dns.reverse(ip); } catch (e) { out.reverseError = e.code || 'lookup failed'; }
+    if (out.hostname) { out.forward = await dns.resolve4(out.hostname).catch(() => []); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(out));
+    return;
+  }
+
+  if (url.pathname === '/api/travel/check' && req.method === 'POST') {
+    try {
+      const results = await runTravelChecks();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(results));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/travel/speedtest' && req.method === 'POST') {
+    if (speedtestRunning) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'A speed test is already running' }));
+      return;
+    }
+    speedtestRunning = true;
+    try {
+      const download = await speedtestDownload();
+      const upload = await speedtestUpload();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ download, upload, checkedAt: new Date().toISOString() }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Speed test failed: ${e.message}` }));
+    } finally {
+      speedtestRunning = false;
+    }
+    return;
+  }
+
   // Static files
   let filePath = url.pathname === '/' ? '/index.html' : url.pathname;
   filePath = path.join(__dirname, 'public', filePath);
@@ -1117,8 +1886,21 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
+// Pure helpers are exported so test.js can exercise them without starting
+// the server. `node server.js` still starts normally.
+module.exports = {
+  parseArpOutput, parseNetstatIb, normalizeMac, netmaskToCidr,
+  cidrToSubnet, subnetIPs, lookupVendor, parseSshOs,
+};
+
+if (require.main === module) {
 server.listen(PORT, () => {
   console.log(`Network Monitor running at http://localhost:${PORT}`);
+  if (AUTH_ENABLED) {
+    console.log('Authentication enabled (MUSTELMON_PASSWORD is set)');
+  } else {
+    console.warn('WARNING: authentication is disabled; anyone who can reach this port can view the dashboard. Set MUSTELMON_PASSWORD to require a login.');
+  }
 
   // Initial data gather
   getEnvironment().catch(console.error); // warm cache early
@@ -1133,9 +1915,9 @@ server.listen(PORT, () => {
   // Periodic updates
   setInterval(updateBandwidth, 2000);
   setInterval(checkConnectivity, 15000);
-  setInterval(() => {
+  setInterval(async () => {
     // Refresh ARP + quick re-check of known devices
-    const arp = readArpTable();
+    const arp = await readArpTable();
     const now = Date.now();
     for (const [ip, entry] of Object.entries(arp)) {
       if (ip.startsWith('127.') || ip === '::1') continue;
@@ -1155,3 +1937,4 @@ server.listen(PORT, () => {
   // Tailscale refresh every 60 seconds (if key is set)
   setInterval(() => refreshTailscale().catch(console.error), 60000);
 });
+}

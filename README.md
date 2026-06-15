@@ -2,7 +2,7 @@
 
 > Real-time network monitor with device fingerprinting, service identification, and Tailscale integration.
 
-Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernetes, or a Coder workspace.
+Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernetes, a Coder workspace, or natively on macOS.
 
 ---
 
@@ -15,11 +15,13 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
   - TCP banner probing → Redis, PostgreSQL, MySQL, MongoDB, etcd
   - DNS reverse-lookup hostname patterns → maps K8s pod names to their service type
 - **Service chips** — colour-coded badges per device: Argo CD, Grafana, Prometheus, GitLab, Loki, Traefik, cert-manager, CoreDNS, Sealed Secrets, MinIO, and more
-- **Live bandwidth** — per-interface RX/TX rates from `/proc/net/dev`, updated every 2 seconds
+- **Live bandwidth** — per-interface RX/TX rates from `/proc/net/dev` (Linux) or `netstat` (macOS), updated every 2 seconds
 - **Internet connectivity** — TCP checks to Cloudflare and Google DNS with latency
 - **Environment detection** — automatically identifies whether it is running inside Kubernetes (and which distribution: K3s, EKS, GKE, AKS…), Docker, a VM, WSL, or bare metal. Decodes the Kubernetes service account JWT, reads cluster CIDR ranges, fingerprints the overlay MTU (VXLAN/Flannel = 1450, WireGuard = 1410, IPIP = 1480), and detects workload platforms (Coder, Gitpod, Codespaces)
 - **Tailscale network panel** — enter a Tailscale API key to fetch all devices on the tailnet: IPs, OS, online status, tags, advertised routes, client version, last-seen
 - **SSE-based live updates** — no polling from the browser; the server pushes bandwidth, scan, and Tailscale events over a persistent connection
+- **Optional authentication** — set `MUSTELMON_PASSWORD` to require a login; sessions are signed HttpOnly cookies
+- **Travel connectivity checks** — on-demand captive portal detection, DNS tampering tests, latency/jitter/loss measurement, outbound port checks, and a Cloudflare speed test for untrusted hotel/cafe Wi-Fi
 - **No build step** — single `server.js` + one HTML file, no npm packages required
 
 ---
@@ -28,7 +30,7 @@ Zero dependencies. Pure Node.js. Runs anywhere — bare metal, Docker, Kubernete
 
 ### Option 1 — Node.js directly
 
-Requires Node.js 18 or later.
+Requires Node.js 18 or later. Works on Linux and macOS.
 
 ```bash
 git clone https://github.com/rwxford/mustelmon.git
@@ -37,6 +39,12 @@ node server.js
 ```
 
 Open http://localhost:3000.
+
+On macOS this is the recommended way to run mustelmon. Docker Desktop on
+macOS cannot use `--network host` (containers run inside a VM and only see
+the VM's network), so the container options below are Linux-only. The native
+macOS build reads the ARP table via `arp -an`, bandwidth via `netstat -ib`,
+and shows the current Wi-Fi network (SSID, channel, signal) in the dashboard.
 
 ### Option 2 — Docker
 
@@ -81,6 +89,23 @@ The key is proxied through the server and never sent back to the browser. It is 
 
 ---
 
+## Travel connectivity checks
+
+The **Travel Connectivity** panel at the bottom of the dashboard is built for untrusted networks — hotel, cafe, airport, and conference Wi-Fi. Everything runs on demand from the machine hosting mustelmon; nothing runs automatically.
+
+**Run Checks** performs four tests in parallel (a few seconds total):
+
+| Check | How it works | What a failure means |
+|---|---|---|
+| Captive portal | Fetches `captive.apple.com` and `gstatic.com/generate_204` over plain HTTP and verifies the exact expected responses | A redirect or altered body means a portal intercepts traffic; the portal login URL is shown when available |
+| DNS integrity | A random nonexistent name must return NXDOMAIN; `one.one.one.one` must resolve to `1.1.1.1`/`1.0.0.1`; DNS-over-HTTPS to `1.1.1.1` is probed as an escape hatch | The network rewrites DNS answers (common on portals and hostile networks) |
+| Latency | 10 TCP connects to `1.1.1.1:443` → loss %, min/avg/max, jitter | High jitter or loss explains why calls and SSH sessions stutter |
+| Outbound ports | TCP connects to `portquiz.net` on 22, 25, 53, 587, 993, 3389, 8443 | Blocked ports — e.g. whether SSH or IMAP will work from this network |
+
+**Speed Test** measures download/upload throughput and TTFB against `speed.cloudflare.com`. It transfers roughly 20 MB down and 5 MB up, so avoid it on metered connections.
+
+---
+
 ## How fingerprinting works
 
 Each discovered device is enriched by running up to four probes concurrently:
@@ -116,27 +141,50 @@ On startup mustelmon probes the local environment and displays a banner showing 
 | Requirement | Notes |
 |---|---|
 | Node.js ≥ 18 | No npm packages needed |
-| Linux | Reads `/proc/net/arp`, `/proc/net/dev`, `/proc/cpuinfo` |
+| Linux or macOS | Linux reads `/proc/net/*`; macOS shells out to `arp`, `netstat`, `route`, and `sysctl` |
 | Network access | Must be able to reach the subnet being scanned |
-| Port 3000 | Configurable by changing `PORT` in `server.js` |
+| Port 3000 | Configurable via the `PORT` environment variable |
 
-macOS and Windows are not currently supported because the network scanning relies on Linux `/proc` interfaces.
+Windows is not currently supported. On macOS, run with Node directly rather
+than Docker (see Quick start).
 
 ---
 
 ## Configuration
 
-There is no config file. The only thing you may want to change is the port:
+There is no config file. The port is set via the `PORT` environment variable:
 
 ```bash
 PORT=8080 node server.js
 ```
 
-Or edit the constant at the top of `server.js`:
+It defaults to 3000.
 
-```js
-const PORT = 3000;
+### Authentication
+
+By default the dashboard is open to anyone who can reach the port. Set
+`MUSTELMON_PASSWORD` to require a login:
+
+```bash
+MUSTELMON_PASSWORD=change-me node server.js
 ```
+
+Notes:
+
+- A single shared password protects the dashboard, all API routes, and the
+  live event stream.
+- Sessions are HMAC-signed, HttpOnly cookies valid for 7 days. The signing
+  secret is generated at startup, so restarting the server signs everyone
+  out.
+- Five consecutive failed attempts lock the source IP out for 60 seconds.
+- mustelmon serves plain HTTP. On an untrusted network (hotel or cafe
+  Wi-Fi), keep it bound to localhost, or reach a remote instance over
+  Tailscale rather than exposing the port. Enabling the password is
+  strongly recommended when running on a laptop, where any device on the
+  same public network could otherwise open the dashboard.
+- For Docker/Compose/Kubernetes/TrueNAS, set `MUSTELMON_PASSWORD` as an
+  environment variable (see the commented examples in `docker-compose.yml`
+  and `k8s.yaml`).
 
 ---
 
@@ -145,13 +193,25 @@ const PORT = 3000;
 ```
 mustelmon/
 ├── server.js          # HTTP server, scanner, fingerprinter, Tailscale proxy
+├── oui.js             # Generated MAC OUI -> vendor map (see scripts/build-oui.js)
+├── mdns.js            # Zero-dependency mDNS/Bonjour discovery
 ├── public/
-│   └── index.html     # Single-page dashboard (no framework, no build step)
+│   ├── index.html     # Single-page dashboard (no framework, no build step)
+│   └── login.html     # Login page (used when MUSTELMON_PASSWORD is set)
+├── scripts/
+│   └── build-oui.js   # Regenerates oui.js from the IEEE OUI registry
+├── test.js            # Zero-dependency tests for the pure helpers
+├── docs/
+│   └── FINGERPRINTING_PLAN.md  # Roadmap for device identification
 ├── Dockerfile
 ├── docker-compose.yml
 ├── k8s.yaml
 └── package.json
 ```
+
+The MAC vendor lookup uses `oui.js`, a curated subset of the public IEEE OUI
+registry covering common consumer and IoT vendors. It is committed so the app
+stays build-free; regenerate it with `node scripts/build-oui.js`.
 
 ---
 

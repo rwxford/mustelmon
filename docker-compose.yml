@@ -12,6 +12,7 @@ services:
       - NET_RAW
       - NET_ADMIN
     restart: unless-stopped
-    # PORT is the only supported env var
     environment:
       - PORT=3000
+      # Uncomment to require a login (recommended):
+      # - MUSTELMON_PASSWORD=change-me
