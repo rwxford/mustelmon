@@ -241,13 +241,87 @@ name where advertised; classifier unit-tested across signal combinations.
 
 ---
 
+## Phase 6: Persistent device identity (track across MAC rotation)
+
+Status: planned, parked until micro-segmentation is in place. Depends on
+Phase 2 (done) and benefits from Phase 3 (UPnP UUID).
+
+Objective: remember a device across reboots and randomized/private MAC
+rotation, so history and a stable label survive even when the MAC changes.
+
+The core problem: a randomized MAC (locally-administered bit set; see
+`lookupVendor` -> `Randomized MAC`) rotates, so it cannot be the key. We
+need a rotation-invariant identity plus durable storage.
+
+Stable identity signals, strongest first:
+
+1. mDNS stable IDs: AirPlay `deviceid`/`pk`, HomeKit (`_hap`) `id`,
+   Chromecast `id`. These persist across MAC changes. (Phase 2 currently
+   captures `model`/`fn`; extend the TXT capture to keep these IDs.)
+2. UPnP `UDN`/USN UUID from Phase 3 (SSDP).
+3. SSH host key or TLS certificate fingerprint for devices that expose one.
+4. DHCP/mDNS hostname: a useful hint, never a sole join key.
+5. The MAC itself when it is universally-administered (not randomized).
+
+Resolution per scan: gather signals, match against existing records by any
+strong identifier, then merge observations (append MAC/IP history, update
+`lastSeen`) or create a new record. Auto-merge only on strong IDs; use
+hostname as a hint. Be conservative to avoid bad merges/splits.
+
+Persistence (zero-dependency):
+
+- JSON snapshot file (recommended start): load on boot, debounced atomic
+  writes (temp file + rename). Fine for thousands of devices.
+- NDJSON event log if full history/timeline is wanted later.
+- Avoid `node:sqlite`; it is experimental and would undercut the
+  build-free, stable-runtime promise.
+
+Deployment: needs a writable, persistent path. Native (macOS/TrueNAS) is
+just a file; Docker/k8s needs a mounted volume/PVC, configured via e.g.
+`MUSTELMON_DATA_DIR`.
+
+Data model sketch:
+
+```
+{ devices: { "<identityKey>": {
+    id, label,            // label = user-set alias
+    category, model, vendorHint,
+    identities: { mdnsId, upnpUuid, hostnames: [], sshHostKey },
+    macs: [{ mac, randomized, firstSeen, lastSeen }],
+    ips:  [{ ip, lastSeen }],
+    firstSeen, lastSeen, services: [], notes
+}}}
+```
+
+Unlocks: stable identity across reboots and MAC rotation, per-device
+history (online/offline timeline, MAC-rotation log, the deferred Phase 3
+history idea), manual aliasing, and new-device alerts.
+
+Caveats: a device that only does randomized L2 and advertises nothing is
+fundamentally un-trackable across rotations; most interesting devices
+(phones, Apple TV, Echo) expose stable mDNS IDs, so practical coverage is
+good. Storing device history is the user's own network data but should
+live on a volume they control.
+
+Effort: medium. Risk: medium (false merges/splits); start conservative and
+only auto-merge on strong identifiers.
+
+Acceptance: a phone with a private MAC keeps one identity across a MAC
+change when it still advertises a stable mDNS/UPnP ID; identity records
+persist across a restart.
+
+---
+
 ## Suggested sequencing
 
-1. Phase 1 (OUI) as its own commit: trivial, instant improvement.
-2. Phase 2 (mDNS) + Phase 5 (classification): the combination that
-   actually labels Apple TVs and Echos with real names.
+1. Phase 1 (OUI): done.
+2. Phase 2 (mDNS): done.
 3. Phase 3 (SSDP) and Phase 4 (targeted probes): add Roku/TV coverage and
    exact model strings.
+4. Phase 5 (classification + UI): fuse all signals into one labeled answer.
+5. Phase 6 (persistent identity): do this after micro-segmentation is
+   live, since the VLAN layout changes what is visible and how identities
+   map across segments.
 
 Each phase ships as a separate commit on the feature branch with tests,
 and is validated on the macOS host where these devices live.
